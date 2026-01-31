@@ -46,10 +46,10 @@ class TestMarketScanner:
 
     def test_filter_pairs_basic(self):
         markets = {
-            "BTC/USDT": {"active": True, "quote": "USDT", "type": "spot"},
-            "ETH/BTC": {"active": True, "quote": "BTC", "type": "spot"},
-            "SOL/USDT": {"active": False, "quote": "USDT", "type": "spot"},
-            "DOGE/USDT": {"active": True, "quote": "USDT", "type": "future"},
+            "BTC/USDT": {"active": True, "quote": "USDT", "type": "swap", "linear": True},
+            "ETH/BTC": {"active": True, "quote": "BTC", "type": "swap", "linear": True},
+            "SOL/USDT": {"active": False, "quote": "USDT", "type": "swap", "linear": True},
+            "DOGE/USDT": {"active": True, "quote": "USDT", "type": "option"},
         }
         result = self.scanner._filter_pairs(markets)
         assert result == ["BTC/USDT"]

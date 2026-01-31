@@ -98,7 +98,7 @@ class MarketScanner:
                 continue
             if info.get("quote", "") != quote:
                 continue
-            if info.get("type", "spot") != "spot":
+            if info.get("linear") is not True and info.get("type", "") not in ("swap", "future", "spot"):
                 continue
             result.append(symbol)
 

@@ -18,12 +18,15 @@ logger = logging.getLogger(__name__)
 
 def _apply_sandbox_urls(exchange, exchange_name: str):
     """Apply sandbox/demo URLs for supported exchanges."""
-    if exchange_name == 'binance':
-        exchange.enable_demo_trading(True)
-        logger.info("Binance demo trading enabled (futures)")
-    else:
-        exchange.set_sandbox_mode(True)
-        logger.info(f"{exchange_name} sandbox mode enabled via CCXT")
+    if hasattr(exchange, 'enable_demo_trading'):
+        try:
+            exchange.enable_demo_trading(True)
+            logger.info(f"{exchange_name} demo trading enabled")
+            return
+        except Exception:
+            pass
+    exchange.set_sandbox_mode(True)
+    logger.info(f"{exchange_name} sandbox mode enabled")
 
 
 class DataConnector(ABC):
@@ -83,7 +86,7 @@ class CCXTConnector(DataConnector):
         
         # Initialize exchange
         is_sandbox = self.config.get('sandbox', False)
-        default_type = 'future' if is_sandbox and exchange_name == 'binance' else 'spot'
+        default_type = 'linear'
         ccxt_keys = {k: v for k, v in self.config.items() if k != 'sandbox'}
         exchange_class = getattr(ccxt, exchange_name)
         self.exchange = exchange_class({
@@ -314,7 +317,7 @@ class MarketDataProcessor:
         """Create comprehensive market state."""
         try:
             # Get market data
-            ohlcv = await connector.get_ohlcv(symbol, timeframe, limit=100)
+            ohlcv = await connector.get_ohlcv(symbol, timeframe, limit=200)
             ticker = await connector.get_ticker(symbol)
             order_book = await connector.get_order_book(symbol)
             

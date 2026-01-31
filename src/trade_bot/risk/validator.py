@@ -317,8 +317,17 @@ class RiskValidator:
         """
         
         # Base position size from risk per trade
+        # risk_amount is in quote currency (USDT), stop_distance is in price units
+        # size = risk_amount / stop_distance gives base currency units
+        # Cap notional value to max_exposure_per_asset * equity
         risk_amount = account_state.equity * self.config["max_risk_per_trade"]
         base_size = risk_amount / stop_distance if stop_distance > 0 else 0
+
+        # Cap by max exposure
+        if market_state.current_price > 0:
+            max_notional = account_state.equity * self.config["max_exposure_per_asset"]
+            max_size = max_notional / market_state.current_price
+            base_size = min(base_size, max_size)
         
         # Adjust for confidence
         size = base_size * confidence

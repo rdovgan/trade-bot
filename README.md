@@ -6,47 +6,96 @@ Crypto trading bot with risk-first architecture. The risk engine has veto power 
 SCAN → SIGNAL → RESEARCH (LLM) → DECIDE → RISK VALIDATOR → EXECUTE → MONITOR → CLOSE → JOURNAL → LEARN
 ```
 
-## Setup
+## Quickstart — Live Trading
+
+### 1. Install
 
 ```bash
-# 1. Install
-pip install -e ".[dev]"
-
-# 2. Configure
-cp .env.example .env
-# Edit .env with your exchange API keys
+pip install -e .
 ```
 
-### Required `.env` variables
+### 2. Create API keys
 
-| Variable | Description |
+| Exchange | Where to create keys |
 |---|---|
-| `EXCHANGE_API_KEY` | Exchange API key (Binance, etc.) |
-| `EXCHANGE_SECRET` | Exchange API secret |
+| **Bybit** | https://www.bybit.com/app/user/api-management |
+| Binance | https://www.binance.com/en/my/settings/api-management |
+| OKX | https://www.okx.com/account/my-api |
 
-### Optional `.env` variables
+Required permissions: **Read + Trade (Futures)**. Do NOT enable Withdraw.
 
-| Variable | Default | Description |
-|---|---|---|
-| `TRADING_SYMBOLS` | `BTC/USDT,ETH/USDT` | Comma-separated trading pairs |
-| `TRADING_TIMEFRAME` | `1m` | Candle timeframe |
-| `MAX_RISK_PER_TRADE` | `0.01` | Max risk per trade (1% of equity) |
-| `MAX_DAILY_LOSS` | `0.05` | Max daily loss before halt (5%) |
-| `LLM_ENABLED` | `false` | Enable LLM market analysis |
-| `LLM_API_KEY` | — | OpenAI-compatible API key |
-
-## Run
+### 3. Configure
 
 ```bash
-# Start trading (sandbox mode by default)
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```bash
+EXCHANGE_NAME=bybit
+EXCHANGE_API_KEY=xxxxxxxxxxxxxxxx
+EXCHANGE_SECRET=xxxxxxxxxxxxxxxx
+EXCHANGE_SANDBOX=false              # false = REAL MONEY
+TRADING_SYMBOLS=BTC/USDT:USDT      # linear futures use :USDT suffix
+```
+
+### 4. Test with demo first (recommended)
+
+```bash
+# Bybit demo keys: https://testnet.bybit.com/app/user/api-management
+EXCHANGE_SANDBOX=true
+```
+
+```bash
 python -m trade_bot.main
 ```
 
-The bot starts in **sandbox/testnet mode** by default. To trade live, set `sandbox: False` in the config.
+Verify in logs that the bot connects, scans, generates signals, and places orders on testnet. Then switch `EXCHANGE_SANDBOX=false` when ready.
+
+### 5. Go live
+
+```bash
+EXCHANGE_SANDBOX=false python -m trade_bot.main
+```
+
+Or set `EXCHANGE_SANDBOX=false` in `.env` and run:
+
+```bash
+python -m trade_bot.main
+```
+
+The bot will:
+1. Scan all USDT perpetual pairs, rank by volume/momentum/spread/volatility
+2. Pick the top N coins (default 5) automatically
+3. Generate signals (mean reversion, trend, breakout) every 60s
+4. Validate every trade through the risk engine before execution
+5. Place market orders with stop-losses on Bybit linear futures
+
+### `.env` Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXCHANGE_NAME` | `bybit` | Exchange id (bybit, binance, okx) |
+| `EXCHANGE_API_KEY` | — | API key |
+| `EXCHANGE_SECRET` | — | API secret |
+| `EXCHANGE_SANDBOX` | `true` | `true` = demo/testnet, `false` = live |
+| `TRADING_SYMBOLS` | `BTC/USDT,ETH/USDT` | Manual symbol list (merged with scanner) |
+| `TRADING_TIMEFRAME` | `1m` | Candle timeframe |
+| `MAX_RISK_PER_TRADE` | `0.01` | 1% equity risk per trade |
+| `MAX_DAILY_LOSS` | `0.05` | 5% daily loss halt |
+| `SCANNER_ENABLED` | `true` | Auto coin selection |
+| `SCANNER_MAX_POSITIONS` | `5` | Max simultaneous positions |
+| `SCANNER_PORTFOLIO_PCT` | `0.50` | % of equity for auto-trading |
+| `SCANNER_MIN_VOLUME_24H` | `1000000` | Min $1M daily volume filter |
+| `SCANNER_BLACKLIST` | — | Comma-separated symbols to skip |
+| `LLM_ENABLED` | `false` | Optional LLM market analysis |
+| `LLM_API_KEY` | — | OpenAI-compatible API key |
 
 ## Run Tests
 
 ```bash
+pip install -e ".[dev]"
 pytest
 ```
 
@@ -124,8 +173,9 @@ src/trade_bot/
   monitoring/     # Exchange health, slippage, regime shift detection
   learning/       # Journal, salience model, reward function, walk-forward backtest
   deployment/     # Staged capital rollout manager
+  scanner/         # Market scanner (auto coin selection)
   main.py         # Bot orchestrator
-tests/unit/       # 147 unit tests
+tests/unit/       # 157 unit tests
 ```
 
 ## License
