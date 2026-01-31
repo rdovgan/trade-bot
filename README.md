@@ -11,6 +11,8 @@ SCAN → SIGNAL → RESEARCH (LLM) → DECIDE → RISK VALIDATOR → EXECUTE →
 ### 1. Install
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
 
@@ -98,6 +100,8 @@ The bot will:
 pip install -e ".[dev]"
 pytest
 ```
+
+All `python` / `pip` commands assume the venv is activated (`source .venv/bin/activate`).
 
 ## How It Works
 

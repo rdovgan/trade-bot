@@ -13,7 +13,7 @@ from ..core.models import (
     MarketState, PositionState, AccountState, Order, Trade,
     TradingAction, OrderType, OrderStatus, Side
 )
-from ..core.enums import Action
+from ..core.enums import Action, Regime
 
 logger = logging.getLogger(__name__)
 
