@@ -64,14 +64,21 @@ class CCXTExchangeConnector(ExchangeConnector):
         self.config = config or {}
         
         # Initialize exchange
+        is_sandbox = self.config.get('sandbox', False)
+        default_type = 'linear'
+        ccxt_keys = {k: v for k, v in self.config.items() if k != 'sandbox'}
         exchange_class = getattr(ccxt, exchange_name)
         self.exchange = exchange_class({
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'},
-            **self.config
+            'timeout': 30000,
+            'options': {'defaultType': default_type},
+            **ccxt_keys
         })
-        
-        logger.info(f"Initialized CCXT exchange connector for {exchange_name}")
+        if is_sandbox:
+            from ..data.connector import _apply_sandbox_urls
+            _apply_sandbox_urls(self.exchange, exchange_name)
+
+        logger.info(f"Initialized CCXT exchange connector for {exchange_name} (sandbox={is_sandbox}, type={default_type})")
     
     async def create_order(
         self,
@@ -94,27 +101,35 @@ class CCXTExchangeConnector(ExchangeConnector):
             elif order_type == OrderType.LIMIT:
                 result = await self.exchange.create_limit_order(symbol, ccxt_side, amount, price)
             elif order_type == OrderType.STOP:
-                # For stop orders, we might need to use stop-market or stop-limit
-                result = await self.exchange.create_order(symbol, 'stop_market', ccxt_side, amount, None, stop_price)
+                # Bybit requires triggerDirection for stop/trigger orders
+                trigger_dir = 'descending' if ccxt_side == 'sell' else 'ascending'
+                result = await self.exchange.create_order(
+                    symbol, 'market', ccxt_side, amount, None,
+                    {
+                        'stopLossPrice': stop_price,
+                        'triggerPrice': stop_price,
+                        'triggerDirection': trigger_dir,
+                    }
+                )
             else:
                 raise ValueError(f"Unsupported order type: {order_type}")
             
             # Convert to our Order model
             order = Order(
-                id=result['id'],
+                id=result.get('id', ''),
                 symbol=symbol,
                 side=side,
                 order_type=order_type,
                 quantity=amount,
                 price=price,
                 stop_price=stop_price,
-                status=self._map_order_status(result['status']),
+                status=self._map_order_status(result.get('status', 'open')),
                 created_at=datetime.fromtimestamp(result['timestamp'] / 1000) if result.get('timestamp') else datetime.now(),
-                filled_quantity=result.get('filled', 0),
-                average_fill_price=result.get('average', None),
-                commission=result.get('fee', {}).get('cost', 0) if result.get('fee') else 0,
+                filled_quantity=result.get('filled') or 0,
+                average_fill_price=result.get('average'),
+                commission=float(result.get('fee', {}).get('cost', 0) or 0) if result.get('fee') else 0,
             )
-            
+
             logger.info(f"Created order: {order.id} {order.side.value} {order.quantity} {symbol}")
             return order
             
@@ -137,19 +152,29 @@ class CCXTExchangeConnector(ExchangeConnector):
         try:
             result = await self.exchange.fetch_order(order_id, symbol)
             
+            raw_side = result.get('side') or 'buy'
+            side_map = {'buy': Side.LONG, 'sell': Side.SHORT}
+            mapped_side = side_map.get(raw_side.lower(), Side.LONG)
+
+            raw_type = result.get('type') or 'market'
+            try:
+                mapped_type = OrderType(raw_type.lower())
+            except ValueError:
+                mapped_type = OrderType.MARKET
+
             order = Order(
-                id=result['id'],
+                id=result.get('id', ''),
                 symbol=symbol,
-                side=Side(result['side'].upper()),
-                order_type=OrderType(result['type'].upper()),
-                quantity=result['amount'],
+                side=mapped_side,
+                order_type=mapped_type,
+                quantity=result.get('amount') or 0,
                 price=result.get('price'),
                 stop_price=result.get('stopPrice'),
-                status=self._map_order_status(result['status']),
+                status=self._map_order_status(result.get('status')),
                 created_at=datetime.fromtimestamp(result['timestamp'] / 1000) if result.get('timestamp') else datetime.now(),
-                filled_quantity=result.get('filled', 0),
-                average_fill_price=result.get('average', None),
-                commission=result.get('fee', {}).get('cost', 0) if result.get('fee') else 0,
+                filled_quantity=result.get('filled') or 0,
+                average_fill_price=result.get('average'),
+                commission=float(result.get('fee', {}).get('cost', 0) or 0) if result.get('fee') else 0,
             )
             
             return order
@@ -162,10 +187,11 @@ class CCXTExchangeConnector(ExchangeConnector):
         """Get account balance."""
         try:
             balance = await self.exchange.fetch_balance()
+            free = balance.get('free', {})
             return {
-                asset: info['free'] 
-                for asset, info in balance['free'].items() 
-                if info > 0
+                asset: float(amount)
+                for asset, amount in free.items()
+                if amount and float(amount) > 0
             }
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
@@ -174,19 +200,18 @@ class CCXTExchangeConnector(ExchangeConnector):
     async def get_positions(self) -> List[Dict]:
         """Get open positions."""
         try:
-            # Not all exchanges support this
             if hasattr(self.exchange, 'fetch_positions'):
                 positions = await self.exchange.fetch_positions()
                 return [
                     {
-                        'symbol': pos['symbol'],
-                        'side': pos['side'],
-                        'size': pos['contracts'],
-                        'entry_price': pos['entryPrice'],
-                        'unrealized_pnl': pos['unrealizedPnl'],
+                        'symbol': pos.get('symbol', ''),
+                        'side': pos.get('side', ''),
+                        'size': pos.get('contracts', 0),
+                        'entry_price': pos.get('entryPrice', 0),
+                        'unrealized_pnl': pos.get('unrealizedPnl', 0),
                     }
-                    for pos in positions 
-                    if float(pos['contracts']) != 0
+                    for pos in positions
+                    if float(pos.get('contracts', 0)) != 0
                 ]
             else:
                 return []
@@ -206,6 +231,10 @@ class CCXTExchangeConnector(ExchangeConnector):
     
     def _map_side(self, side: Side) -> str:
         """Map side to CCXT format."""
+        if side == Side.LONG:
+            return 'buy'
+        elif side == Side.SHORT:
+            return 'sell'
         return side.value.lower()
     
     def _map_order_status(self, ccxt_status: str) -> OrderStatus:
@@ -217,6 +246,8 @@ class CCXTExchangeConnector(ExchangeConnector):
             'cancelled': OrderStatus.CANCELLED,
             'rejected': OrderStatus.REJECTED,
         }
+        if not ccxt_status:
+            return OrderStatus.PENDING
         return mapping.get(ccxt_status.lower(), OrderStatus.PENDING)
     
     async def close(self):

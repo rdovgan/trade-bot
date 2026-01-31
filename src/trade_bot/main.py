@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from .core.models import MarketState, PositionState, AccountState, RiskState
 from .core.enums import Side, Regime
@@ -20,6 +23,7 @@ from .learning.journal import TradeJournal
 from .learning.loop import LearningLoop
 from .monitoring.monitor import MonitoringEngine
 from .deployment.manager import DeploymentManager
+from .scanner.market_scanner import MarketScanner
 
 # Configure logging
 logging.basicConfig(
@@ -39,7 +43,14 @@ class TradingBot:
     
     def __init__(self, config: Optional[Dict] = None):
         """Initialize trading bot."""
-        self.config = config or self._default_config()
+        defaults = self._default_config()
+        if config:
+            for key, val in config.items():
+                if isinstance(val, dict) and key in defaults and isinstance(defaults[key], dict):
+                    defaults[key].update(val)
+                else:
+                    defaults[key] = val
+        self.config = defaults
         self._running = False
         
         # Initialize components
@@ -55,9 +66,9 @@ class TradingBot:
         """Default configuration."""
         return {
             'exchange': {
-                'name': 'binance',  # Default to Binance
+                'name': 'bybit',  # Default to Bybit
                 'sandbox': True,    # Use testnet by default
-                'api_key': os.getenv('EXCHANGE_API_KEY'),
+                'apiKey': os.getenv('EXCHANGE_API_KEY'),
                 'secret': os.getenv('EXCHANGE_SECRET'),
             },
             'trading': {
@@ -72,6 +83,15 @@ class TradingBot:
             'llm': {
                 'enabled': False,  # Disabled by default
             },
+            'scanner': {
+                'enabled': True,
+                'scan_interval_minutes': 15,
+                'quote_currency': 'USDT',
+                'min_volume_24h': 1_000_000,
+                'max_positions': 5,
+                'portfolio_pct': 0.50,
+                'blacklist': [],
+            },
         }
     
     def _init_components(self):
@@ -79,12 +99,24 @@ class TradingBot:
         try:
             # Initialize data connector
             exchange_config = self.config['exchange'].copy()
-            if exchange_config['sandbox']:
-                exchange_config['sandboxMode'] = True
-            
+            exchange_name = exchange_config.pop('name')
+            is_sandbox = exchange_config.pop('sandbox', False)
+
+            # Build clean CCXT config (remove keys CCXT doesn't understand)
+            ccxt_config = {
+                k: v for k, v in exchange_config.items()
+                if k in ('api_key', 'secret', 'apiKey', 'password', 'uid', 'options')
+            }
+            # Remap our key names to CCXT names
+            if 'api_key' in ccxt_config:
+                ccxt_config['apiKey'] = ccxt_config.pop('api_key')
+
+            if is_sandbox:
+                ccxt_config['sandbox'] = True
+
             self.data_connector = CCXTConnector(
-                exchange_config['name'],
-                exchange_config
+                exchange_name,
+                ccxt_config.copy()
             )
             self.data_manager = DataManager(self.data_connector)
             
@@ -104,8 +136,8 @@ class TradingBot:
             
             # Initialize execution engine
             self.exchange_connector = CCXTExchangeConnector(
-                exchange_config['name'],
-                exchange_config
+                exchange_name,
+                ccxt_config.copy()
             )
             self.position_monitor = PositionMonitor(self.exchange_connector)
             self.execution_engine = ExecutionEngine(
@@ -122,6 +154,12 @@ class TradingBot:
 
             # Initialize deployment manager
             self.deployment_manager = DeploymentManager()
+
+            # Initialize market scanner
+            scanner_cfg = self.config.get('scanner', {})
+            self.scanner = MarketScanner(scanner_cfg) if scanner_cfg.get('enabled') else None
+            self._scanned_symbols: list = []
+            self._last_scan_time: Optional[datetime] = None
             
             # Initialize state
             self.account_state = AccountState(
@@ -177,25 +215,65 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error stopping trading bot: {e}")
     
+    async def _run_market_scan(self):
+        """Run market scanner and update the active symbol list."""
+        if self.scanner is None:
+            return
+
+        scanner_cfg = self.config.get('scanner', {})
+        interval = scanner_cfg.get('scan_interval_minutes', 15)
+
+        now = datetime.now()
+        if self._last_scan_time and (now - self._last_scan_time) < timedelta(minutes=interval):
+            return
+
+        try:
+            exchange = self.data_connector.exchange
+            candidates = await self.scanner.scan_market(exchange)
+            max_pos = scanner_cfg.get('max_positions', 5)
+            top = self.scanner.get_top_candidates(max_pos)
+
+            new_symbols = [c.symbol for c in top]
+            if new_symbols != self._scanned_symbols:
+                added = set(new_symbols) - set(self._scanned_symbols)
+                removed = set(self._scanned_symbols) - set(new_symbols)
+                if added:
+                    logger.info(f"Scanner added symbols: {added}")
+                if removed:
+                    logger.info(f"Scanner removed symbols: {removed}")
+                self._scanned_symbols = new_symbols
+
+            self._last_scan_time = now
+            logger.info(f"Market scan complete — top {len(new_symbols)} candidates")
+
+        except Exception as e:
+            logger.error(f"Error during market scan: {e}")
+
     async def _trading_loop(self):
         """Main trading loop."""
-        symbols = self.config['trading']['symbols']
+        user_symbols = self.config['trading']['symbols']
         timeframe = self.config['trading']['timeframe']
-        
-        logger.info(f"Starting trading loop for {len(symbols)} symbols")
-        
+
+        logger.info(f"Starting trading loop for {len(user_symbols)} user symbols")
+
         while self._running:
             try:
+                # Run market scan if enabled
+                await self._run_market_scan()
+
+                # Merge user-specified symbols with scanner results
+                all_symbols = list(dict.fromkeys(user_symbols + self._scanned_symbols))
+
                 # Process each symbol
-                for symbol in symbols:
+                for symbol in all_symbols:
                     await self._process_symbol(symbol, timeframe)
-                
+
                 # Update daily performance
                 await self._update_daily_performance()
-                
+
                 # Wait before next iteration
                 await asyncio.sleep(60)  # Process every minute
-                
+
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}")
                 await asyncio.sleep(10)  # Back off on error
@@ -358,14 +436,80 @@ class TradingBot:
         }
 
 
+def _config_from_env() -> Dict:
+    """Build config dict from environment variables."""
+    config: Dict = {}
+
+    # Exchange
+    exchange_name = os.getenv('EXCHANGE_NAME', '').strip()
+    sandbox_raw = os.getenv('EXCHANGE_SANDBOX', '').strip().lower()
+    if exchange_name or sandbox_raw:
+        config['exchange'] = {}
+        if exchange_name:
+            config['exchange']['name'] = exchange_name
+        if sandbox_raw in ('0', 'false', 'no'):
+            config['exchange']['sandbox'] = False
+        elif sandbox_raw in ('1', 'true', 'yes'):
+            config['exchange']['sandbox'] = True
+
+    # Trading
+    symbols_raw = os.getenv('TRADING_SYMBOLS', '').strip()
+    timeframe = os.getenv('TRADING_TIMEFRAME', '').strip()
+    if symbols_raw or timeframe:
+        config['trading'] = {}
+        if symbols_raw:
+            config['trading']['symbols'] = [s.strip() for s in symbols_raw.split(',') if s.strip()]
+        if timeframe:
+            config['trading']['timeframe'] = timeframe
+
+    # Risk
+    risk_per_trade = os.getenv('MAX_RISK_PER_TRADE', '').strip()
+    daily_loss = os.getenv('MAX_DAILY_LOSS', '').strip()
+    if risk_per_trade or daily_loss:
+        config['risk'] = {}
+        if risk_per_trade:
+            config['risk']['max_risk_per_trade'] = float(risk_per_trade)
+        if daily_loss:
+            config['risk']['max_daily_loss'] = float(daily_loss)
+
+    # Scanner
+    scanner_enabled = os.getenv('SCANNER_ENABLED', '').strip().lower()
+    scanner_max_pos = os.getenv('SCANNER_MAX_POSITIONS', '').strip()
+    scanner_portfolio = os.getenv('SCANNER_PORTFOLIO_PCT', '').strip()
+    scanner_min_vol = os.getenv('SCANNER_MIN_VOLUME_24H', '').strip()
+    scanner_blacklist = os.getenv('SCANNER_BLACKLIST', '').strip()
+    scanner_interval = os.getenv('SCANNER_INTERVAL_MINUTES', '').strip()
+    if any([scanner_enabled, scanner_max_pos, scanner_portfolio]):
+        config['scanner'] = {}
+        if scanner_enabled in ('0', 'false', 'no'):
+            config['scanner']['enabled'] = False
+        elif scanner_enabled in ('1', 'true', 'yes'):
+            config['scanner']['enabled'] = True
+        if scanner_max_pos:
+            config['scanner']['max_positions'] = int(scanner_max_pos)
+        if scanner_portfolio:
+            config['scanner']['portfolio_pct'] = float(scanner_portfolio)
+        if scanner_min_vol:
+            config['scanner']['min_volume_24h'] = float(scanner_min_vol)
+        if scanner_blacklist:
+            config['scanner']['blacklist'] = [s.strip() for s in scanner_blacklist.split(',') if s.strip()]
+        if scanner_interval:
+            config['scanner']['scan_interval_minutes'] = int(scanner_interval)
+
+    # LLM
+    llm_enabled = os.getenv('LLM_ENABLED', '').strip().lower()
+    if llm_enabled in ('1', 'true', 'yes'):
+        config['llm'] = {'enabled': True, 'api_key': os.getenv('LLM_API_KEY', '')}
+
+    return config
+
+
 async def main():
     """Main entry point."""
-    # Load configuration from environment or file
-    config = None  # Could load from config file
-    
-    # Create and start bot
-    bot = TradingBot(config)
-    
+    config = _config_from_env()
+
+    bot = TradingBot(config if config else None)
+
     try:
         await bot.start()
     except KeyboardInterrupt:

@@ -55,6 +55,11 @@ class MeanReversionSignal(SignalGenerator):
             current_sma = sma.iloc[-1]
             current_std = std.iloc[-1]
             
+            logger.debug(
+                f"MeanReversion: price={current_price:.2f} lower={lower_band.iloc[-1]:.2f} "
+                f"upper={upper_band.iloc[-1]:.2f} sma={current_sma:.2f}"
+            )
+
             # Generate signals based on Bollinger Band penetration
             if current_price <= lower_band.iloc[-1]:
                 # Price is below lower band - potential buy signal
@@ -128,8 +133,11 @@ class TrendFollowingSignal(SignalGenerator):
             # Calculate ATR for stop loss
             atr = market_state.atr
             
+            prev_fast = fast_ma.iloc[-2]
+            prev_slow = slow_ma.iloc[-2]
+
             # Generate signals based on moving average crossover
-            if current_fast > current_slow and current_price > current_fast:
+            if current_fast > current_slow and (prev_fast <= prev_slow or current_price > current_fast):
                 # Uptrend - potential buy signal
                 stop_distance = atr * 2.0
                 expected_return = atr * 3.0  # 3:1 R:R ratio
@@ -145,7 +153,7 @@ class TrendFollowingSignal(SignalGenerator):
                     confidence=min((current_fast - current_slow) / (current_slow * 0.02), 1.0)
                 )
             
-            elif current_fast < current_slow and current_price < current_fast:
+            elif current_fast < current_slow and (prev_fast >= prev_slow or current_price < current_fast):
                 # Downtrend - potential sell signal
                 stop_distance = atr * 2.0
                 expected_return = atr * 3.0  # 3:1 R:R ratio
@@ -195,10 +203,6 @@ class VolatilityBreakoutSignal(SignalGenerator):
             
             current_price = market_state.current_price
             current_vol = volatility.iloc[-1]
-            
-            # Only trade in high volatility environments
-            if current_vol < avg_volatility * 1.5:
-                return None
             
             # Calculate price levels
             resistance = df['high'].rolling(window=self.lookback).max().iloc[-1]
@@ -268,36 +272,30 @@ class SignalManager:
         logger.info(f"Added signal generator for {regime.value} regime")
     
     def generate_signals(
-        self, 
+        self,
         market_state: MarketState
     ) -> List[TradingAction]:
-        """Generate signals from all appropriate generators."""
+        """Generate signals from all generators. Regime match boosts confidence."""
         signals = []
         current_regime = market_state.regime_label
-        
-        # Get generators for current regime
-        regime_generators = self.regime_generators.get(current_regime, [])
-        
-        # Generate signals from each generator
-        for generator in regime_generators:
+
+        for generator in self.generators:
             try:
                 signal = generator.generate_signal(market_state)
                 if signal:
+                    # Boost confidence if regime matches, penalize if not
+                    if generator.get_required_regime() == current_regime:
+                        signal.confidence = min(signal.confidence * 1.2, 1.0)
+                    else:
+                        signal.confidence *= 0.7
                     signals.append(signal)
-                    logger.debug(f"Generated {signal.action.value} signal with confidence {signal.confidence:.2f}")
+                    logger.debug(
+                        f"{generator.__class__.__name__}: {signal.action.value} "
+                        f"conf={signal.confidence:.2f} (regime={current_regime.value})"
+                    )
             except Exception as e:
                 logger.error(f"Error generating signal from {generator.__class__.__name__}: {e}")
-        
-        # Also try generators that work in any regime
-        for generator in self.generators:
-            if generator.get_required_regime() == Regime.LOW_VOL:  # Assume LOW_VOL means any regime
-                try:
-                    signal = generator.generate_signal(market_state)
-                    if signal:
-                        signals.append(signal)
-                except Exception as e:
-                    logger.error(f"Error generating signal from {generator.__class__.__name__}: {e}")
-        
+
         logger.info(f"Generated {len(signals)} signals for {current_regime.value} regime")
         return signals
     
@@ -316,10 +314,10 @@ def create_default_signal_manager() -> SignalManager:
     """Create a signal manager with default generators."""
     manager = SignalManager()
     
-    # Add default signal generators
-    manager.add_generator(MeanReversionSignal(lookback=20, threshold=2.0))
-    manager.add_generator(TrendFollowingSignal(fast_period=10, slow_period=30))
-    manager.add_generator(VolatilityBreakoutSignal(lookback=20, multiplier=2.0))
+    # Add default signal generators (with looser thresholds for 1m timeframe)
+    manager.add_generator(MeanReversionSignal(lookback=14, threshold=1.5))
+    manager.add_generator(TrendFollowingSignal(fast_period=5, slow_period=15))
+    manager.add_generator(VolatilityBreakoutSignal(lookback=14, multiplier=1.5))
     
     logger.info("Created default signal manager")
     return manager

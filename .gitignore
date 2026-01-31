@@ -127,7 +127,7 @@ dmypy.json
 .journal.db
 trade_bot.log
 config/secrets.json
-data/
+/data/
 logs/
 backtests/
 

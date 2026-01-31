@@ -301,8 +301,9 @@ class TestRiskValidator:
         )
         
         # Expected: 1% of 10000 = 100 risk amount
-        # Position size = 100 / 2 = 50
-        expected_size = 50.0
+        # risk-based size = 100 / 2 = 50
+        # exposure cap = 30% * 10000 / 100 = 30
+        expected_size = 30.0
         assert abs(size - expected_size) < 0.01
     
     def test_calculate_position_size_with_drawdown(self):
@@ -316,8 +317,8 @@ class TestRiskValidator:
             self.account_state, self.market_state, stop_distance
         )
         
-        # Should be 50% reduced
-        expected_size = 25.0  # 50% of normal size
+        # Exposure cap = 30% * 10000 / 100 = 30, then 50% drawdown reduction = 15
+        expected_size = 15.0
         assert abs(size - expected_size) < 0.01
     
     def test_update_risk_state(self):

@@ -1,7 +1,7 @@
 """Market data connector interface and implementations."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, AsyncGenerator
+from typing import Dict, List, Optional, AsyncGenerator, Sequence
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -13,6 +13,20 @@ from ..core.models import MarketState
 from ..core.enums import Regime
 
 logger = logging.getLogger(__name__)
+
+
+
+def _apply_sandbox_urls(exchange, exchange_name: str):
+    """Apply sandbox/demo URLs for supported exchanges."""
+    if hasattr(exchange, 'enable_demo_trading'):
+        try:
+            exchange.enable_demo_trading(True)
+            logger.info(f"{exchange_name} demo trading enabled")
+            return
+        except Exception:
+            pass
+    exchange.set_sandbox_mode(True)
+    logger.info(f"{exchange_name} sandbox mode enabled")
 
 
 class DataConnector(ABC):
@@ -47,6 +61,16 @@ class DataConnector(ABC):
         pass
     
     @abstractmethod
+    async def get_all_tickers(self, symbols: Optional[List[str]] = None) -> Dict:
+        """Fetch all tickers at once."""
+        pass
+
+    @abstractmethod
+    async def get_markets(self) -> Dict:
+        """Fetch market info (all available instruments)."""
+        pass
+
+    @abstractmethod
     async def close(self):
         """Close connection."""
         pass
@@ -61,14 +85,20 @@ class CCXTConnector(DataConnector):
         self.config = config or {}
         
         # Initialize exchange
+        is_sandbox = self.config.get('sandbox', False)
+        default_type = 'linear'
+        ccxt_keys = {k: v for k, v in self.config.items() if k != 'sandbox'}
         exchange_class = getattr(ccxt, exchange_name)
         self.exchange = exchange_class({
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'},
-            **self.config
+            'timeout': 30000,
+            'options': {'defaultType': default_type},
+            **ccxt_keys
         })
-        
-        logger.info(f"Initialized CCXT connector for {exchange_name}")
+        if is_sandbox:
+            _apply_sandbox_urls(self.exchange, exchange_name)
+
+        logger.info(f"Initialized CCXT connector for {exchange_name} (sandbox={is_sandbox}, type={default_type})")
     
     async def get_ohlcv(
         self, 
@@ -97,11 +127,11 @@ class CCXTConnector(DataConnector):
             ticker = await self.exchange.fetch_ticker(symbol)
             return {
                 'symbol': symbol,
-                'last': ticker['last'],
-                'bid': ticker['bid'],
-                'ask': ticker['ask'],
-                'volume': ticker['baseVolume'],
-                'timestamp': ticker['timestamp'],
+                'last': ticker.get('last', 0),
+                'bid': ticker.get('bid', 0),
+                'ask': ticker.get('ask', 0),
+                'volume': ticker.get('baseVolume', 0),
+                'timestamp': ticker.get('timestamp', 0),
             }
         except Exception as e:
             logger.error(f"Error fetching ticker for {symbol}: {e}")
@@ -111,19 +141,21 @@ class CCXTConnector(DataConnector):
         """Get order book data."""
         try:
             orderbook = await self.exchange.fetch_order_book(symbol, limit)
-            
+
             # Calculate order book imbalance
-            bids_total = sum(bid[1] for bid in orderbook['bids'][:10])
-            asks_total = sum(ask[1] for ask in orderbook['asks'][:10])
+            bids = orderbook.get('bids', [])
+            asks = orderbook.get('asks', [])
+            bids_total = sum(bid[1] for bid in bids[:10]) if bids else 0
+            asks_total = sum(ask[1] for ask in asks[:10]) if asks else 0
             imbalance = (bids_total - asks_total) / (bids_total + asks_total) if (bids_total + asks_total) > 0 else 0
-            
+
             return {
                 'symbol': symbol,
-                'bids': orderbook['bids'],
-                'asks': orderbook['asks'],
+                'bids': bids,
+                'asks': asks,
                 'imbalance': imbalance,
-                'spread': orderbook['asks'][0][0] - orderbook['bids'][0][0] if orderbook['bids'] and orderbook['asks'] else 0,
-                'timestamp': orderbook['timestamp'],
+                'spread': asks[0][0] - bids[0][0] if bids and asks else 0,
+                'timestamp': orderbook.get('timestamp', 0),
             }
         except Exception as e:
             logger.error(f"Error fetching order book for {symbol}: {e}")
@@ -150,6 +182,26 @@ class CCXTConnector(DataConnector):
                 logger.error(f"Error in trade stream for {symbol}: {e}")
                 await asyncio.sleep(5)  # Back off on error
     
+    async def get_all_tickers(self, symbols: Optional[List[str]] = None) -> Dict:
+        """Fetch all tickers at once via CCXT fetch_tickers."""
+        try:
+            tickers = await self.exchange.fetch_tickers(symbols)
+            logger.debug(f"Fetched {len(tickers)} tickers")
+            return tickers
+        except Exception as e:
+            logger.error(f"Error fetching tickers: {e}")
+            raise
+
+    async def get_markets(self) -> Dict:
+        """Fetch market info via CCXT load_markets."""
+        try:
+            markets = await self.exchange.load_markets()
+            logger.debug(f"Loaded {len(markets)} markets")
+            return markets
+        except Exception as e:
+            logger.error(f"Error loading markets: {e}")
+            raise
+
     async def close(self):
         """Close exchange connection."""
         await self.exchange.close()
@@ -265,7 +317,7 @@ class MarketDataProcessor:
         """Create comprehensive market state."""
         try:
             # Get market data
-            ohlcv = await connector.get_ohlcv(symbol, timeframe, limit=100)
+            ohlcv = await connector.get_ohlcv(symbol, timeframe, limit=200)
             ticker = await connector.get_ticker(symbol)
             order_book = await connector.get_order_book(symbol)
             
@@ -284,11 +336,13 @@ class MarketDataProcessor:
                 vol_percentile = 50
             
             # Calculate spread
-            spread = ticker['ask'] - ticker['bid'] if ticker['bid'] and ticker['ask'] else 0
-            
+            bid = ticker.get('bid', 0) or 0
+            ask = ticker.get('ask', 0) or 0
+            spread = ask - bid if bid and ask else 0
+
             market_state = MarketState(
                 ohlcv=ohlcv,
-                current_price=ticker['last'],
+                current_price=ticker.get('last', 0) or 0,
                 atr=atr,
                 realized_volatility=volatility,
                 spread=spread,
