@@ -64,14 +64,21 @@ class CCXTExchangeConnector(ExchangeConnector):
         self.config = config or {}
         
         # Initialize exchange
+        is_sandbox = self.config.get('sandbox', False)
+        default_type = 'future' if is_sandbox and exchange_name == 'binance' else 'spot'
+        ccxt_keys = {k: v for k, v in self.config.items() if k != 'sandbox'}
         exchange_class = getattr(ccxt, exchange_name)
         self.exchange = exchange_class({
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'},
-            **self.config
+            'timeout': 30000,
+            'options': {'defaultType': default_type},
+            **ccxt_keys
         })
-        
-        logger.info(f"Initialized CCXT exchange connector for {exchange_name}")
+        if is_sandbox:
+            from ..data.connector import _apply_sandbox_urls
+            _apply_sandbox_urls(self.exchange, exchange_name)
+
+        logger.info(f"Initialized CCXT exchange connector for {exchange_name} (sandbox={is_sandbox}, type={default_type})")
     
     async def create_order(
         self,
@@ -101,14 +108,14 @@ class CCXTExchangeConnector(ExchangeConnector):
             
             # Convert to our Order model
             order = Order(
-                id=result['id'],
+                id=result.get('id', ''),
                 symbol=symbol,
                 side=side,
                 order_type=order_type,
                 quantity=amount,
                 price=price,
                 stop_price=stop_price,
-                status=self._map_order_status(result['status']),
+                status=self._map_order_status(result.get('status', 'open')),
                 created_at=datetime.fromtimestamp(result['timestamp'] / 1000) if result.get('timestamp') else datetime.now(),
                 filled_quantity=result.get('filled', 0),
                 average_fill_price=result.get('average', None),
@@ -162,10 +169,11 @@ class CCXTExchangeConnector(ExchangeConnector):
         """Get account balance."""
         try:
             balance = await self.exchange.fetch_balance()
+            free = balance.get('free', {})
             return {
-                asset: info['free'] 
-                for asset, info in balance['free'].items() 
-                if info > 0
+                asset: float(amount)
+                for asset, amount in free.items()
+                if amount and float(amount) > 0
             }
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
@@ -179,14 +187,14 @@ class CCXTExchangeConnector(ExchangeConnector):
                 positions = await self.exchange.fetch_positions()
                 return [
                     {
-                        'symbol': pos['symbol'],
-                        'side': pos['side'],
-                        'size': pos['contracts'],
-                        'entry_price': pos['entryPrice'],
-                        'unrealized_pnl': pos['unrealizedPnl'],
+                        'symbol': pos.get('symbol', ''),
+                        'side': pos.get('side', ''),
+                        'size': pos.get('contracts', 0),
+                        'entry_price': pos.get('entryPrice', 0),
+                        'unrealized_pnl': pos.get('unrealizedPnl', 0),
                     }
-                    for pos in positions 
-                    if float(pos['contracts']) != 0
+                    for pos in positions
+                    if float(pos.get('contracts', 0)) != 0
                 ]
             else:
                 return []
