@@ -94,7 +94,12 @@ class CCXTExchangeConnector(ExchangeConnector):
             # Map order types
             ccxt_type = self._map_order_type(order_type)
             ccxt_side = self._map_side(side)
-            
+
+            # Clamp amount to exchange market limits and precision
+            amount = await self._clamp_amount(symbol, amount)
+            if amount <= 0:
+                raise ValueError(f"Order amount for {symbol} is zero after applying exchange limits")
+
             # Create order
             if order_type == OrderType.MARKET:
                 result = await self.exchange.create_market_order(symbol, ccxt_side, amount)
@@ -150,7 +155,7 @@ class CCXTExchangeConnector(ExchangeConnector):
     async def get_order(self, order_id: str, symbol: str) -> Optional[Order]:
         """Get order status."""
         try:
-            result = await self.exchange.fetch_order(order_id, symbol)
+            result = await self.exchange.fetch_order(order_id, symbol, params={'acknowledged': True})
             
             raw_side = result.get('side') or 'buy'
             side_map = {'buy': Side.LONG, 'sell': Side.SHORT}
@@ -219,6 +224,33 @@ class CCXTExchangeConnector(ExchangeConnector):
             logger.error(f"Error fetching positions: {e}")
             return []
     
+    async def _clamp_amount(self, symbol: str, amount: float) -> float:
+        """Clamp order amount to exchange min/max and precision."""
+        try:
+            if not self.exchange.markets:
+                await self.exchange.load_markets()
+            market = self.exchange.markets.get(symbol)
+            if not market:
+                return amount
+
+            limits = market.get('limits', {}).get('amount', {})
+            max_qty = limits.get('max')
+            min_qty = limits.get('min')
+
+            if max_qty and amount > max_qty:
+                logger.warning(f"{symbol}: clamping amount {amount} -> {max_qty} (exchange max)")
+                amount = max_qty
+            if min_qty and amount < min_qty:
+                logger.warning(f"{symbol}: amount {amount} below exchange min {min_qty}")
+                return 0
+
+            # Apply precision
+            amount = self.exchange.amount_to_precision(symbol, amount)
+            return float(amount)
+        except Exception as e:
+            logger.warning(f"Could not clamp amount for {symbol}: {e}")
+            return amount
+
     def _map_order_type(self, order_type: OrderType) -> str:
         """Map order type to CCXT format."""
         mapping = {
@@ -457,7 +489,12 @@ class ExecutionEngine:
         while (datetime.now() - start_time).seconds < timeout:
             try:
                 updated_order = await self.exchange.get_order(order.id, order.symbol)
-                
+
+                if updated_order is None:
+                    logger.warning(f"Could not fetch order {order.id}, assuming filled for market orders")
+                    self._pending_orders.pop(order.id, None)
+                    return True
+
                 if updated_order.status == OrderStatus.FILLED:
                     # Move to completed orders
                     self._pending_orders.pop(order.id, None)
