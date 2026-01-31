@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from .core.models import MarketState, PositionState, AccountState, RiskState
 from .core.enums import Side, Regime
@@ -20,6 +23,7 @@ from .learning.journal import TradeJournal
 from .learning.loop import LearningLoop
 from .monitoring.monitor import MonitoringEngine
 from .deployment.manager import DeploymentManager
+from .scanner.market_scanner import MarketScanner
 
 # Configure logging
 logging.basicConfig(
@@ -39,7 +43,14 @@ class TradingBot:
     
     def __init__(self, config: Optional[Dict] = None):
         """Initialize trading bot."""
-        self.config = config or self._default_config()
+        defaults = self._default_config()
+        if config:
+            for key, val in config.items():
+                if isinstance(val, dict) and key in defaults and isinstance(defaults[key], dict):
+                    defaults[key].update(val)
+                else:
+                    defaults[key] = val
+        self.config = defaults
         self._running = False
         
         # Initialize components
@@ -72,6 +83,15 @@ class TradingBot:
             'llm': {
                 'enabled': False,  # Disabled by default
             },
+            'scanner': {
+                'enabled': True,
+                'scan_interval_minutes': 15,
+                'quote_currency': 'USDT',
+                'min_volume_24h': 1_000_000,
+                'max_positions': 5,
+                'portfolio_pct': 0.50,
+                'blacklist': [],
+            },
         }
     
     def _init_components(self):
@@ -79,12 +99,24 @@ class TradingBot:
         try:
             # Initialize data connector
             exchange_config = self.config['exchange'].copy()
-            if exchange_config['sandbox']:
-                exchange_config['sandboxMode'] = True
-            
+            exchange_name = exchange_config.pop('name')
+            is_sandbox = exchange_config.pop('sandbox', False)
+
+            # Build clean CCXT config (remove keys CCXT doesn't understand)
+            ccxt_config = {
+                k: v for k, v in exchange_config.items()
+                if k in ('api_key', 'secret', 'apiKey', 'password', 'uid', 'options')
+            }
+            # Remap our key names to CCXT names
+            if 'api_key' in ccxt_config:
+                ccxt_config['apiKey'] = ccxt_config.pop('api_key')
+
+            if is_sandbox:
+                ccxt_config['sandbox'] = True
+
             self.data_connector = CCXTConnector(
-                exchange_config['name'],
-                exchange_config
+                exchange_name,
+                ccxt_config.copy()
             )
             self.data_manager = DataManager(self.data_connector)
             
@@ -104,8 +136,8 @@ class TradingBot:
             
             # Initialize execution engine
             self.exchange_connector = CCXTExchangeConnector(
-                exchange_config['name'],
-                exchange_config
+                exchange_name,
+                ccxt_config.copy()
             )
             self.position_monitor = PositionMonitor(self.exchange_connector)
             self.execution_engine = ExecutionEngine(
@@ -122,6 +154,12 @@ class TradingBot:
 
             # Initialize deployment manager
             self.deployment_manager = DeploymentManager()
+
+            # Initialize market scanner
+            scanner_cfg = self.config.get('scanner', {})
+            self.scanner = MarketScanner(scanner_cfg) if scanner_cfg.get('enabled') else None
+            self._scanned_symbols: list = []
+            self._last_scan_time: Optional[datetime] = None
             
             # Initialize state
             self.account_state = AccountState(
@@ -177,25 +215,65 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error stopping trading bot: {e}")
     
+    async def _run_market_scan(self):
+        """Run market scanner and update the active symbol list."""
+        if self.scanner is None:
+            return
+
+        scanner_cfg = self.config.get('scanner', {})
+        interval = scanner_cfg.get('scan_interval_minutes', 15)
+
+        now = datetime.now()
+        if self._last_scan_time and (now - self._last_scan_time) < timedelta(minutes=interval):
+            return
+
+        try:
+            exchange = self.data_connector.exchange
+            candidates = await self.scanner.scan_market(exchange)
+            max_pos = scanner_cfg.get('max_positions', 5)
+            top = self.scanner.get_top_candidates(max_pos)
+
+            new_symbols = [c.symbol for c in top]
+            if new_symbols != self._scanned_symbols:
+                added = set(new_symbols) - set(self._scanned_symbols)
+                removed = set(self._scanned_symbols) - set(new_symbols)
+                if added:
+                    logger.info(f"Scanner added symbols: {added}")
+                if removed:
+                    logger.info(f"Scanner removed symbols: {removed}")
+                self._scanned_symbols = new_symbols
+
+            self._last_scan_time = now
+            logger.info(f"Market scan complete — top {len(new_symbols)} candidates")
+
+        except Exception as e:
+            logger.error(f"Error during market scan: {e}")
+
     async def _trading_loop(self):
         """Main trading loop."""
-        symbols = self.config['trading']['symbols']
+        user_symbols = self.config['trading']['symbols']
         timeframe = self.config['trading']['timeframe']
-        
-        logger.info(f"Starting trading loop for {len(symbols)} symbols")
-        
+
+        logger.info(f"Starting trading loop for {len(user_symbols)} user symbols")
+
         while self._running:
             try:
+                # Run market scan if enabled
+                await self._run_market_scan()
+
+                # Merge user-specified symbols with scanner results
+                all_symbols = list(dict.fromkeys(user_symbols + self._scanned_symbols))
+
                 # Process each symbol
-                for symbol in symbols:
+                for symbol in all_symbols:
                     await self._process_symbol(symbol, timeframe)
-                
+
                 # Update daily performance
                 await self._update_daily_performance()
-                
+
                 # Wait before next iteration
                 await asyncio.sleep(60)  # Process every minute
-                
+
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}")
                 await asyncio.sleep(10)  # Back off on error
