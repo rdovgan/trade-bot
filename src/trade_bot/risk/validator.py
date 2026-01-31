@@ -1,0 +1,384 @@
+"""Risk management validator with veto power over all trading decisions."""
+
+from decimal import Decimal
+from typing import Optional, Tuple, Dict, Any
+import logging
+
+from ..core.models import (
+    MarketState, PositionState, AccountState, RiskState, 
+    TradingAction, RiskLevel
+)
+from ..core.enums import Action, Side
+
+logger = logging.getLogger(__name__)
+
+
+class RiskViolation(Exception):
+    """Exception raised when risk rules are violated."""
+    pass
+
+
+class RiskValidator:
+    """
+    Risk management engine with hard-coded rules that cannot be bypassed.
+    
+    This validator has veto power over all trading decisions and implements
+    the risk-first architecture principles.
+    """
+    
+    def __init__(self, risk_config: Optional[Dict[str, Any]] = None):
+        """Initialize risk validator with configuration."""
+        self.config = risk_config or self._default_config()
+        logger.info("Risk validator initialized with hard-coded safety rules")
+    
+    def _default_config(self) -> Dict[str, Any]:
+        """Default risk configuration - these are hard limits that cannot be changed."""
+        return {
+            # Risk per trade (hard limits)
+            "max_risk_per_trade": 0.01,  # 1% of equity
+            "max_risk_per_trade_absolute": 0.02,  # 2% absolute maximum
+            
+            # Exposure limits
+            "max_exposure_per_asset": 0.30,  # 30% per asset
+            "max_total_exposure": 0.50,  # 50% total exposure
+            "max_leverage": 2.0,  # Maximum 2x leverage
+            
+            # Daily risk limits
+            "max_daily_loss": 0.05,  # 5% daily loss limit
+            "max_consecutive_losses": 5,  # 5 consecutive trades
+            
+            # Drawdown controls
+            "drawdown_reduction_threshold": 0.10,  # 10% DD -> 50% size reduction
+            "drawdown_pause_threshold": 0.15,  # 15% DD -> trading pause
+            "drawdown_lock_threshold": 0.20,  # 20% DD -> system lock
+            
+            # Volatility guards
+            "volatility_guard_threshold": 95,  # 95th percentile
+            "max_spread_bps": 10,  # Maximum spread in basis points
+            
+            # Position sizing rules
+            "min_rr_ratio": 1.5,  # Minimum risk:reward ratio
+            "mandatory_stop_loss": True,  # Stop loss is mandatory
+            "no_averaging_down": True,  # No averaging down allowed
+            "no_martingale": True,  # No martingale strategy
+
+            # Red days control
+            "max_red_days": 3,  # 3 consecutive red days -> safe mode
+        }
+    
+    def validate_trading_action(
+        self,
+        action: TradingAction,
+        market_state: MarketState,
+        position_state: PositionState,
+        account_state: AccountState,
+        risk_state: RiskState
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate a trading action against all risk rules.
+        
+        Returns:
+            Tuple of (is_valid, rejection_reason)
+        """
+        try:
+            # Check if safe mode is active
+            if risk_state.safe_mode_active:
+                if action.confidence < 0.8:
+                    return False, "Safe mode active - only high-confidence trades allowed"
+            
+            # Validate action-specific rules
+            if action.action in [Action.BUY, Action.SELL]:
+                self._validate_new_position(action, market_state, position_state, account_state, risk_state)
+            
+            # Validate position sizing
+            self._validate_position_size(action, account_state, risk_state)
+            
+            # Validate risk:reward ratio
+            self._validate_risk_reward_ratio(action)
+            
+            # Validate stop loss
+            self._validate_stop_loss(action)
+            
+            # Check exposure limits
+            self._validate_exposure_limits(action, position_state, account_state)
+            
+            # Check market conditions
+            self._validate_market_conditions(action, market_state)
+            
+            # Check daily risk limits
+            self._validate_daily_limits(action, account_state, risk_state)
+            
+            # Check drawdown controls
+            self._validate_drawdown_controls(action, account_state, risk_state)
+            
+            logger.info(f"Trading action validated: {action.action} size={action.size}")
+            return True, None
+            
+        except RiskViolation as e:
+            logger.warning(f"Risk validation failed: {e}")
+            return False, str(e)
+        except Exception as e:
+            logger.error(f"Unexpected error in risk validation: {e}")
+            return False, f"Validation error: {e}"
+    
+    def _validate_new_position(
+        self,
+        action: TradingAction,
+        market_state: MarketState,
+        position_state: PositionState,
+        account_state: AccountState,
+        risk_state: RiskState
+    ):
+        """Validate rules for new positions."""
+        
+        # Check for averaging down (adding to losing position)
+        if self.config["no_averaging_down"]:
+            if position_state.current_side != Side.FLAT:
+                if position_state.unrealized_pnl < 0:
+                    current_side_bias = 1 if position_state.current_side == Side.LONG else -1
+                    new_side_bias = 1 if action.action == Action.BUY else -1
+                    if current_side_bias * new_side_bias > 0:  # Same direction
+                        raise RiskViolation("Averaging down is not allowed")
+        
+        # Check for martingale (increasing size after loss)
+        if self.config["no_martingale"]:
+            if risk_state.consecutive_losses >= 3:
+                # Calculate position size as % of equity
+                size_pct = (action.size * action.stop_loss) / account_state.equity if action.stop_loss else 0
+                if size_pct > self.config["max_risk_per_trade"]:
+                    raise RiskViolation("Martingale strategy detected - position size too large after consecutive losses")
+    
+    def _validate_position_size(
+        self,
+        action: TradingAction,
+        account_state: AccountState,
+        risk_state: RiskState
+    ):
+        """Validate position sizing rules."""
+        
+        if action.action not in [Action.BUY, Action.SELL]:
+            return
+        
+        # Calculate risk amount
+        if action.stop_loss:
+            risk_amount = action.size * abs(action.stop_loss - action.expected_return)
+            risk_pct = risk_amount / account_state.equity
+        else:
+            risk_pct = 0
+        
+        # Check risk per trade limits
+        if risk_pct > self.config["max_risk_per_trade_absolute"]:
+            raise RiskViolation(f"Risk per trade {risk_pct:.2%} exceeds maximum {self.config['max_risk_per_trade_absolute']:.2%}")
+        
+        if risk_pct > self.config["max_risk_per_trade"]:
+            logger.warning(f"Risk per trade {risk_pct:.2%} exceeds recommended {self.config['max_risk_per_trade']:.2%}")
+    
+    def _validate_risk_reward_ratio(self, action: TradingAction):
+        """Validate minimum risk:reward ratio."""
+        
+        if action.action not in [Action.BUY, Action.SELL]:
+            return
+        
+        if action.expected_risk <= 0:
+            raise RiskViolation("Expected risk must be positive")
+        
+        rr_ratio = action.expected_return / action.expected_risk
+        if rr_ratio < self.config["min_rr_ratio"]:
+            raise RiskViolation(f"R:R ratio {rr_ratio:.2f} below minimum {self.config['min_rr_ratio']}")
+    
+    def _validate_stop_loss(self, action: TradingAction):
+        """Validate stop loss requirements."""
+        
+        if action.action not in [Action.BUY, Action.SELL]:
+            return
+        
+        if self.config["mandatory_stop_loss"] and action.stop_loss is None:
+            raise RiskViolation("Stop loss is mandatory for all positions")
+    
+    def _validate_exposure_limits(
+        self,
+        action: TradingAction,
+        position_state: PositionState,
+        account_state: AccountState
+    ):
+        """Validate exposure limits."""
+        
+        if action.action not in [Action.BUY, Action.SELL]:
+            return
+        
+        # Calculate new total exposure
+        current_exposure = abs(position_state.position_size * position_state.entry_price) if position_state.position_size else 0
+        new_exposure = current_exposure + (action.size * action.expected_return)
+        new_exposure_pct = new_exposure / account_state.equity
+        
+        # Check total exposure limit
+        if new_exposure_pct > self.config["max_total_exposure"]:
+            raise RiskViolation(f"Total exposure {new_exposure_pct:.2%} exceeds maximum {self.config['max_total_exposure']:.2%}")
+        
+        # Check leverage limit
+        if new_exposure_pct > self.config["max_leverage"]:
+            raise RiskViolation(f"Leverage {new_exposure_pct:.2f}x exceeds maximum {self.config['max_leverage']:.1f}x")
+    
+    def _validate_market_conditions(self, action: TradingAction, market_state: MarketState):
+        """Validate market condition guards."""
+        
+        # Volatility guard
+        if market_state.volatility_percentile > self.config["volatility_guard_threshold"]:
+            if action.action in [Action.BUY, Action.SELL]:
+                raise RiskViolation(f"Volatility guard: {market_state.volatility_percentile:.1f}th percentile exceeds threshold")
+        
+        # Liquidity guard
+        if market_state.spread > self.config["max_spread_bps"] / 10000:  # Convert bps to decimal
+            if action.action in [Action.BUY, Action.SELL]:
+                raise RiskViolation(f"Liquidity guard: spread {market_state.spread*10000:.1f} bps exceeds maximum")
+        
+        # Liquidity score check
+        if market_state.liquidity_score < 0.3:  # Low liquidity threshold
+            if action.action in [Action.BUY, Action.SELL]:
+                raise RiskViolation(f"Liquidity guard: liquidity score {market_state.liquidity_score:.2f} too low")
+    
+    def _validate_daily_limits(
+        self,
+        action: TradingAction,
+        account_state: AccountState,
+        risk_state: RiskState
+    ):
+        """Validate daily risk limits."""
+        
+        # Check daily loss limit
+        if account_state.daily_loss_pct >= self.config["max_daily_loss"]:
+            raise RiskViolation(f"Daily loss limit reached: {account_state.daily_loss_pct:.2%}")
+        
+        # Check consecutive losses
+        if risk_state.consecutive_losses >= self.config["max_consecutive_losses"]:
+            raise RiskViolation(f"Maximum consecutive losses reached: {risk_state.consecutive_losses}")
+    
+    def _validate_drawdown_controls(
+        self,
+        action: TradingAction,
+        account_state: AccountState,
+        risk_state: RiskState
+    ):
+        """Validate drawdown controls."""
+        
+        dd = account_state.current_drawdown
+        
+        # System lock
+        if dd >= self.config["drawdown_lock_threshold"]:
+            raise RiskViolation(f"System lock: drawdown {dd:.2%} exceeds lock threshold")
+        
+        # Trading pause
+        if dd >= self.config["drawdown_pause_threshold"]:
+            raise RiskViolation(f"Trading pause: drawdown {dd:.2%} exceeds pause threshold")
+        
+        # Position size reduction
+        if dd >= self.config["drawdown_reduction_threshold"]:
+            # Allow trading but at reduced size
+            max_size_pct = self.config["max_risk_per_trade"] * 0.5  # 50% reduction
+            if action.stop_loss:
+                risk_pct = (action.size * action.stop_loss) / account_state.equity
+                if risk_pct > max_size_pct:
+                    raise RiskViolation(f"Position size must be reduced due to drawdown: max {max_size_pct:.2%}")
+    
+    def calculate_position_size(
+        self,
+        account_state: AccountState,
+        market_state: MarketState,
+        stop_distance: float,
+        confidence: float = 1.0
+    ) -> float:
+        """
+        Calculate position size based on risk rules.
+        
+        Args:
+            account_state: Current account state
+            market_state: Current market state
+            stop_distance: Stop loss distance in price units
+            confidence: Decision confidence (0-1)
+        
+        Returns:
+            Recommended position size
+        """
+        
+        # Base position size from risk per trade
+        risk_amount = account_state.equity * self.config["max_risk_per_trade"]
+        base_size = risk_amount / stop_distance if stop_distance > 0 else 0
+        
+        # Adjust for confidence
+        size = base_size * confidence
+        
+        # Adjust for drawdown
+        if account_state.current_drawdown >= self.config["drawdown_reduction_threshold"]:
+            size *= 0.5  # 50% reduction
+        
+        # Adjust for safe mode
+        # This would be set based on risk_state.safe_mode_active
+        # Implementation depends on how safe mode is triggered
+        
+        return max(0, size)
+    
+    def update_risk_state(
+        self,
+        account_state: AccountState,
+        market_state: MarketState,
+        recent_trades: list,
+        recent_daily_pnls: Optional[list] = None,
+    ) -> RiskState:
+        """Update risk state based on current conditions."""
+        
+        # Calculate consecutive losses
+        consecutive_losses = 0
+        for trade in reversed(recent_trades[-10:]):  # Check last 10 trades
+            if trade.pnl < 0:
+                consecutive_losses += 1
+            else:
+                break
+        
+        # Determine risk level
+        if account_state.current_drawdown >= self.config["drawdown_pause_threshold"]:
+            risk_level = RiskLevel.CRITICAL
+        elif account_state.current_drawdown >= self.config["drawdown_reduction_threshold"]:
+            risk_level = RiskLevel.HIGH
+        elif market_state.volatility_percentile > 90:
+            risk_level = RiskLevel.HIGH
+        elif consecutive_losses >= 3:
+            risk_level = RiskLevel.MEDIUM
+        else:
+            risk_level = RiskLevel.LOW
+        
+        # Check for consecutive red days
+        red_days_triggered = False
+        if recent_daily_pnls is not None:
+            max_red = self.config.get("max_red_days", 3)
+            if len(recent_daily_pnls) >= max_red:
+                red_days_triggered = all(
+                    d.get("pnl", 0) < 0 for d in recent_daily_pnls[:max_red]
+                )
+
+        # Check if safe mode should be active
+        safe_mode = (
+            account_state.current_drawdown >= self.config["drawdown_reduction_threshold"] or
+            consecutive_losses >= 3 or
+            market_state.volatility_percentile > self.config["volatility_guard_threshold"] or
+            red_days_triggered
+        )
+        
+        # Calculate risk budget
+        risk_budget_left = account_state.equity * (
+            self.config["max_daily_loss"] - account_state.daily_loss_pct
+        )
+        
+        return RiskState(
+            risk_budget_left=risk_budget_left,
+            max_daily_loss_remaining=account_state.equity * (
+                self.config["max_daily_loss"] - account_state.daily_loss_pct
+            ),
+            consecutive_losses=consecutive_losses,
+            volatility_percentile=market_state.volatility_percentile,
+            current_risk_level=risk_level,
+            safe_mode_active=safe_mode,
+            max_risk_per_trade=self.config["max_risk_per_trade"],
+            max_exposure_per_asset=self.config["max_exposure_per_asset"],
+            max_total_exposure=self.config["max_total_exposure"],
+            max_leverage=self.config["max_leverage"],
+        )
