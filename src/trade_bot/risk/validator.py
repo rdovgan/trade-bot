@@ -143,7 +143,7 @@ class RiskValidator:
         market_state: MarketState,
         position_state: PositionState,
         account_state: AccountState,
-        risk_state: RiskState
+        risk_state: RiskState,
     ):
         """Validate rules for new positions."""
         
@@ -168,7 +168,7 @@ class RiskValidator:
         self,
         action: TradingAction,
         account_state: AccountState,
-        risk_state: RiskState
+        risk_state: RiskState,
     ):
         """Validate position sizing rules."""
         
@@ -257,7 +257,7 @@ class RiskValidator:
         self,
         action: TradingAction,
         account_state: AccountState,
-        risk_state: RiskState
+        risk_state: RiskState,
     ):
         """Validate daily risk limits."""
         
@@ -273,7 +273,7 @@ class RiskValidator:
         self,
         action: TradingAction,
         account_state: AccountState,
-        risk_state: RiskState
+        risk_state: RiskState,
     ):
         """Validate drawdown controls."""
         
