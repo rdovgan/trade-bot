@@ -1,7 +1,7 @@
 """Risk management validator with veto power over all trading decisions."""
 
 from decimal import Decimal
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import logging
 
 from ..core.models import (
@@ -28,7 +28,10 @@ class RiskValidator:
     
     def __init__(self, risk_config: Optional[Dict[str, Any]] = None):
         """Initialize risk validator with configuration."""
-        self.config = risk_config or self._default_config()
+        defaults = self._default_config()
+        if risk_config:
+            defaults.update(risk_config)
+        self.config = defaults
         logger.info("Risk validator initialized with hard-coded safety rules")
     
     def _default_config(self) -> Dict[str, Any]:
@@ -64,6 +67,9 @@ class RiskValidator:
 
             # Red days control
             "max_red_days": 3,  # 3 consecutive red days -> safe mode
+
+            # Max concurrent positions (scanner)
+            "max_positions": 5,
         }
     
     def validate_trading_action(
@@ -72,15 +78,25 @@ class RiskValidator:
         market_state: MarketState,
         position_state: PositionState,
         account_state: AccountState,
-        risk_state: RiskState
+        risk_state: RiskState,
+        active_positions: int = 0,
     ) -> Tuple[bool, Optional[str]]:
         """
         Validate a trading action against all risk rules.
-        
+
+        Args:
+            active_positions: Number of currently open positions (used for max_positions check).
+
         Returns:
             Tuple of (is_valid, rejection_reason)
         """
         try:
+            # Check max concurrent positions
+            if action.action in [Action.BUY, Action.SELL]:
+                max_pos = self.config.get("max_positions", 5)
+                if active_positions >= max_pos:
+                    return False, f"Max positions reached ({active_positions}/{max_pos})"
+
             # Check if safe mode is active
             if risk_state.safe_mode_active:
                 if action.confidence < 0.8:
@@ -144,7 +160,7 @@ class RiskValidator:
         if self.config["no_martingale"]:
             if risk_state.consecutive_losses >= 3:
                 # Calculate position size as % of equity
-                size_pct = (action.size * action.stop_loss) / account_state.equity if action.stop_loss else 0
+                size_pct = (action.size * action.stop_loss) / account_state.equity if action.stop_loss and account_state.equity > 0 else 0
                 if size_pct > self.config["max_risk_per_trade"]:
                     raise RiskViolation("Martingale strategy detected - position size too large after consecutive losses")
     
@@ -162,7 +178,7 @@ class RiskValidator:
         # Calculate risk amount
         if action.stop_loss:
             risk_amount = action.size * abs(action.stop_loss - action.expected_return)
-            risk_pct = risk_amount / account_state.equity
+            risk_pct = risk_amount / account_state.equity if account_state.equity > 0 else 1.0
         else:
             risk_pct = 0
         
@@ -207,9 +223,9 @@ class RiskValidator:
             return
         
         # Calculate new total exposure
-        current_exposure = abs(position_state.position_size * position_state.entry_price) if position_state.position_size else 0
+        current_exposure = abs(position_state.position_size * position_state.entry_price) if position_state.position_size and position_state.entry_price else 0
         new_exposure = current_exposure + (action.size * action.expected_return)
-        new_exposure_pct = new_exposure / account_state.equity
+        new_exposure_pct = new_exposure / account_state.equity if account_state.equity > 0 else 1.0
         
         # Check total exposure limit
         if new_exposure_pct > self.config["max_total_exposure"]:
@@ -276,7 +292,7 @@ class RiskValidator:
             # Allow trading but at reduced size
             max_size_pct = self.config["max_risk_per_trade"] * 0.5  # 50% reduction
             if action.stop_loss:
-                risk_pct = (action.size * action.stop_loss) / account_state.equity
+                risk_pct = (action.size * action.stop_loss) / account_state.equity if account_state.equity > 0 else 1.0
                 if risk_pct > max_size_pct:
                     raise RiskViolation(f"Position size must be reduced due to drawdown: max {max_size_pct:.2%}")
     

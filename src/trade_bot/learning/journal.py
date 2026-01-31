@@ -206,7 +206,7 @@ class TradeJournal:
                 win_rate = winning_trades / trades_count if trades_count > 0 else 0
                 
                 # Calculate daily return percentage
-                pnl_pct = (pnl / (equity - pnl)) * 100 if equity != pnl else 0
+                pnl_pct = (pnl / (equity - pnl)) * 100 if (equity - pnl) != 0 else 0
                 
                 # Calculate max drawdown for the day
                 max_drawdown = self._calculate_max_drawdown(trades)
