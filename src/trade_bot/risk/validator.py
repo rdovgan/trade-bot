@@ -190,12 +190,16 @@ class RiskValidator:
             # No stop loss — treat as maximum risk (full position notional)
             risk_pct = 1.0
 
-        # Check risk per trade limits
+        # Check risk per trade limits against absolute maximum
         if risk_pct > self.config["max_risk_per_trade_absolute"]:
-            raise RiskViolation(f"Risk per trade {risk_pct:.2%} exceeds maximum {self.config['max_risk_per_trade_absolute']:.2%}")
+            raise RiskViolation(f"Risk per trade {risk_pct:.2%} exceeds absolute maximum {self.config['max_risk_per_trade_absolute']:.2%}")
 
-        if risk_pct > self.config["max_risk_per_trade"]:
-            logger.warning(f"Risk per trade {risk_pct:.2%} exceeds recommended {self.config['max_risk_per_trade']:.2%}")
+        # Check against dynamic max risk (which is reduced during drawdown)
+        if risk_pct > risk_state.max_risk_per_trade:
+            raise RiskViolation(f"Risk per trade {risk_pct:.2%} exceeds dynamic maximum {risk_state.max_risk_per_trade:.2%}")
+
+        # If it passes, log an info message
+        logger.info(f"Risk per trade {risk_pct:.2%} is within dynamic maximum {risk_state.max_risk_per_trade:.2%}")
     
     def _validate_risk_reward_ratio(self, action: TradingAction):
         """Validate minimum risk:reward ratio."""

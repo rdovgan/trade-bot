@@ -234,9 +234,17 @@ class CCXTConnector(DataConnector):
 
 class MarketDataProcessor:
     """Processes market data and calculates indicators."""
-    
-    def __init__(self, lookback_periods: Dict[str, int] = None):
-        """Initialize market data processor."""
+
+    def __init__(self, lookback_periods: Dict[str, int] = None, max_data_age_multiplier: float = 1.0):
+        """Initialize market data processor.
+
+        Args:
+            lookback_periods: Number of periods to use for each indicator
+            max_data_age_multiplier: Multiplier for max acceptable data age.
+                                    Use higher values (e.g., 100) for sandbox/testnet.
+                                    Default 1.0 for production strict validation.
+        """
+        self.max_data_age_multiplier = max_data_age_multiplier
         self.lookback_periods = lookback_periods or {
             'atr': 14,
             'volatility': 20,
@@ -340,18 +348,21 @@ class MarketDataProcessor:
         latest_timestamp = ohlcv.index[-1]
         now = datetime.now()
 
-        # Map timeframe to max acceptable age
-        max_age_seconds = {
+        # Map timeframe to base max acceptable age
+        base_max_age_seconds = {
             '1m': 120,   # 2 minutes
             '5m': 600,   # 10 minutes
             '15m': 1800, # 30 minutes
             '1h': 7200,  # 2 hours
         }.get(timeframe, 300)
 
+        # Apply multiplier (higher for sandbox/testnet)
+        max_age_seconds = base_max_age_seconds * self.max_data_age_multiplier
+
         age = (now - latest_timestamp).total_seconds()
 
         if age > max_age_seconds:
-            logger.warning(f"Market data is stale: age={age:.0f}s, max={max_age_seconds}s")
+            logger.warning(f"Market data is stale: age={age:.0f}s, max={max_age_seconds:.0f}s")
             return False
 
         return True
@@ -446,11 +457,17 @@ class MarketDataProcessor:
 
 class DataManager:
     """Manages market data collection and processing."""
-    
-    def __init__(self, connector: DataConnector):
-        """Initialize data manager."""
+
+    def __init__(self, connector: DataConnector, max_data_age_multiplier: float = 1.0):
+        """Initialize data manager.
+
+        Args:
+            connector: Data connector for fetching market data
+            max_data_age_multiplier: Multiplier for max acceptable data age.
+                                    Use higher values (e.g., 100) for sandbox/testnet.
+        """
         self.connector = connector
-        self.processor = MarketDataProcessor()
+        self.processor = MarketDataProcessor(max_data_age_multiplier=max_data_age_multiplier)
         self._running = False
         
     async def start(self):

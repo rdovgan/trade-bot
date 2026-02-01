@@ -17,7 +17,7 @@ SCAN → SIGNAL → RESEARCH → DECIDE → RISK VALIDATOR → EXECUTE → MONIT
 - **Maximum exposure per asset**: 30% of equity
 - **Maximum total exposure**: 50% of equity
 - **Maximum leverage**: 2x
-- **Daily loss limit**: 3-5% (trading halt when reached)
+- **Daily loss limit**: 5% (trading halt when reached)
 - **Drawdown controls**:
   - >10% DD: 50% position size reduction
   - >15% DD: Trading pause
@@ -36,6 +36,7 @@ SCAN → SIGNAL → RESEARCH → DECIDE → RISK VALIDATOR → EXECUTE → MONIT
 - [ ] All dependencies installed (`pip install -e ".[dev]"`)
 - [ ] Environment variables configured (see `.env.example`)
 - [ ] Exchange API credentials configured and tested
+- [ ] LLM Advisory (`LLM_ENABLED`) checked: ensure it's disabled unless fully tested/justified for live use.
 - [ ] Database directory created with proper permissions
 
 ### 2. Risk Configuration Review

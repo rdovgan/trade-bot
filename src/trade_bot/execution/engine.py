@@ -109,14 +109,22 @@ class CCXTExchangeConnector(ExchangeConnector):
             elif order_type == OrderType.LIMIT:
                 result = await self.exchange.create_limit_order(symbol, ccxt_side, amount, price)
             elif order_type == OrderType.STOP:
-                # Bybit requires triggerDirection for stop/trigger orders
-                trigger_dir = 'descending' if ccxt_side == 'sell' else 'ascending'
+                # Create a Stop Market order (stops are always reverse side to close position)
+                params = {}
+                # Bybit requires triggerDirection
+                if self.exchange_name == 'bybit':
+                    params['triggerDirection'] = 'descending' if ccxt_side == 'sell' else 'ascending'
+                
+                # Use 'stop_market' type for safety - ensures immediate fill when trigger hits
                 result = await self.exchange.create_order(
-                    symbol, 'market', ccxt_side, amount, None,
-                    {
-                        'stopLossPrice': stop_price,
-                        'triggerPrice': stop_price,
-                        'triggerDirection': trigger_dir,
+                    symbol=symbol, 
+                    type='stop_market', 
+                    side=ccxt_side, 
+                    amount=amount, 
+                    price=None,
+                    params={
+                        'stopPrice': stop_price,
+                        **params
                     }
                 )
             else:
@@ -140,10 +148,20 @@ class CCXTExchangeConnector(ExchangeConnector):
 
             logger.info(f"Created order: {order.id} {order.side.value} {order.quantity} {symbol}")
             return order
-            
+
         except Exception as e:
-            logger.error(f"Error creating order: {e}")
-            raise
+            error_str = str(e)
+            # Handle insufficient margin as a normal operational condition
+            if '-2019' in error_str or 'Margin is insufficient' in error_str or 'insufficient' in error_str.lower():
+                logger.warning(f"Insufficient margin to create order for {symbol}: {e}")
+                return None
+            # Handle other common operational errors
+            elif any(code in error_str for code in ['-1121', '-2010', '-4131']):  # Invalid symbol, new order rejected, balance insufficient
+                logger.warning(f"Order rejected for {symbol}: {e}")
+                return None
+            else:
+                logger.error(f"Error creating order: {e}")
+                raise
     
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """Cancel an order."""
@@ -186,9 +204,15 @@ class CCXTExchangeConnector(ExchangeConnector):
             )
             
             return order
-            
+
         except Exception as e:
-            logger.error(f"Error fetching order {order_id}: {e}")
+            # Common case: order doesn't exist (filled/cancelled/expired)
+            # Log at debug level to reduce noise
+            error_str = str(e)
+            if any(phrase in error_str for phrase in ['does not exist', 'not found', '-2013']):
+                logger.debug(f"Order {order_id} not found on exchange: {e}")
+            else:
+                logger.error(f"Error fetching order {order_id}: {e}")
             return None
     
     async def get_balance(self) -> Dict[str, float]:
@@ -483,21 +507,34 @@ class ExecutionEngine:
                 price=price
             )
 
+            # Handle failed order creation (e.g., insufficient margin)
+            if order is None:
+                logger.warning(f"Order creation failed for {symbol}, action not executed")
+                # Cancel stop order if we created one
+                if stop_order_id:
+                    try:
+                        await self.exchange.cancel_order(stop_order_id, symbol)
+                        async with state_manager.lock_state("orders"):
+                            self._pending_orders.pop(stop_order_id, None)
+                    except Exception:
+                        pass
+                return None
+
             # Track order
             async with state_manager.lock_state("orders"):
                 self._pending_orders[order.id] = order
-            
+
             logger.info(
                 f"Executed {action.action.value} order: "
                 f"{action.size} {symbol} @ {current_price}"
             )
-            
+
             # Wait for order to fill (for market orders)
             if order_type == OrderType.MARKET:
                 await self._wait_for_fill(order, stop_order_id=stop_order_id, expected_price=current_price)
 
             return order
-            
+
         except Exception as e:
             logger.error(f"Error executing action: {e}")
             raise
@@ -524,9 +561,14 @@ class ExecutionEngine:
             
             logger.info(f"Created stop loss order: {stop_order.id} @ {stop_price}")
             return stop_order
-            
+
         except Exception as e:
-            logger.error(f"Error creating stop loss order: {e}")
+            error_str = str(e)
+            # Handle insufficient margin and other operational errors
+            if any(phrase in error_str for phrase in ['-2019', 'insufficient', '-1121', '-2010', '-4131']):
+                logger.warning(f"Could not create stop loss order for {symbol}: {e}")
+            else:
+                logger.error(f"Error creating stop loss order: {e}")
             return None
     
     async def _wait_for_fill(self, order: Order, timeout: int = 30, stop_order_id: Optional[str] = None, expected_price: float = 0):
@@ -651,12 +693,24 @@ class ExecutionEngine:
                     try:
                         updated_order = await self.exchange.get_order(order_id, order.symbol)
 
-                        if updated_order and updated_order.status == OrderStatus.FILLED:
+                        if updated_order is None:
+                            # Order doesn't exist on exchange (get_order caught exception and returned None)
+                            logger.warning(f"Order {order_id} not found on exchange, removing from tracking")
+                            async with state_manager.lock_state("orders"):
+                                self._pending_orders.pop(order_id, None)
+                            # Clean up any trade links
+                            if order_id in self._stop_to_trade:
+                                trade_id = self._stop_to_trade.pop(order_id)
+                                self._trade_links.pop(trade_id, None)
+                                logger.info(f"Cleaned up trade links for missing order {order_id}")
+                            continue
+
+                        if updated_order.status == OrderStatus.FILLED:
                             await self._handle_order_fill(updated_order)
-                        elif updated_order and updated_order.status in [OrderStatus.CANCELLED, OrderStatus.REJECTED]:
+                        elif updated_order.status in [OrderStatus.CANCELLED, OrderStatus.REJECTED]:
                             await self._handle_order_cancel(updated_order)
                     except Exception as e:
-                        logger.error(f"Error checking order {order_id}: {e}")
+                        logger.error(f"Unexpected error checking order {order_id}: {e}")
 
                 await asyncio.sleep(2)  # Check every 2 seconds
 

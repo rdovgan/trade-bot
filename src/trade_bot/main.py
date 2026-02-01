@@ -78,6 +78,9 @@ class TradingBot:
                 'timeframe': '1m',
                 'max_position_size': 0.1,
             },
+            'data': {
+                'max_data_age_multiplier': 100.0,  # Lenient for sandbox (100x normal threshold)
+            },
             'risk': {
                 'max_risk_per_trade': 0.01,  # 1%
                 'max_daily_loss': 0.03,      # 3%
@@ -120,7 +123,15 @@ class TradingBot:
                 exchange_name,
                 ccxt_config.copy()
             )
-            self.data_manager = DataManager(self.data_connector)
+
+            # Get data age multiplier (higher for sandbox/testnet)
+            data_config = self.config.get('data', {})
+            max_data_age_multiplier = data_config.get('max_data_age_multiplier', 1.0)
+
+            self.data_manager = DataManager(
+                self.data_connector,
+                max_data_age_multiplier=max_data_age_multiplier
+            )
 
             # Initialize risk validator
             self.risk_validator = RiskValidator(self.config['risk'])
@@ -136,6 +147,10 @@ class TradingBot:
                 self.llm_advisor
             )
 
+            # Initialize learning system (before execution engine needs it)
+            self.journal = TradeJournal()
+            self.learning_loop = LearningLoop(self.journal)
+
             # Initialize execution engine
             self.exchange_connector = CCXTExchangeConnector(
                 exchange_name,
@@ -147,10 +162,6 @@ class TradingBot:
                 self.position_monitor,
                 journal=self.journal
             )
-
-            # Initialize learning system
-            self.journal = TradeJournal()
-            self.learning_loop = LearningLoop(self.journal)
 
             # Initialize monitoring
             self.monitoring_engine = MonitoringEngine()

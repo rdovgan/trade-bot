@@ -39,6 +39,7 @@ class LLMAdvisor:
     ALLOWED_FIELDS = {
         'regime_confirmation', 'risk_factors', 'opportunity_score',
         'confidence_adjustment', 'reasoning',
+        'take_profit_target', 'stop_loss_target',
     }
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -99,7 +100,9 @@ class LLMAdvisor:
                         "You are a market analysis advisor. Provide structured analysis "
                         "in JSON format with these fields only: regime_confirmation (string), "
                         "risk_factors (list of strings), opportunity_score (float 0-1), "
-                        "confidence_adjustment (float -0.3 to 0.3), reasoning (string). "
+                        "confidence_adjustment (float -0.3 to 0.3), reasoning (string), "
+                        "take_profit_target (float/null), stop_loss_target (float/null). "
+                        "Use the targets to suggest a dynamic exit based on observed market manipulation or specific chart patterns. "
                         "You must NOT suggest position sizes, leverage changes, or stop-loss removal."
                     )
                 },
@@ -315,6 +318,26 @@ class DecisionEngine:
         # Adjust confidence based on insights
         confidence_adjustment = insights.get('confidence_adjustment', 0.0)
         adjusted.confidence = max(0.0, min(1.0, adjusted.confidence + confidence_adjustment))
+
+        # Dynamic Stop Loss / Take Profit adjustment from LLM
+        llm_sl = insights.get('stop_loss_target')
+        llm_tp = insights.get('take_profit_target')
+
+        if llm_sl is not None and llm_sl > 0:
+            adjusted.stop_loss = llm_sl
+            # Re-calculate expected risk based on new SL
+            market_price = self.signal_manager.get_last_price() # Assumes signal manager can cache this
+            if market_price and adjusted.stop_loss:
+                adjusted.expected_risk = abs(adjusted.stop_loss - market_price)
+            logger.debug(f"LLM adjusted Stop Loss to {llm_sl}")
+
+        if llm_tp is not None and llm_tp > 0:
+            adjusted.take_profit = llm_tp
+            # Re-calculate expected return based on new TP
+            market_price = self.signal_manager.get_last_price() # Assumes signal manager can cache this
+            if market_price and adjusted.take_profit:
+                adjusted.expected_return = abs(adjusted.take_profit - market_price)
+            logger.debug(f"LLM adjusted Take Profit to {llm_tp}")
 
         logger.debug(
             f"Adjusted signal confidence from {signal.confidence:.2f} "
