@@ -7,6 +7,7 @@ from .models import (
 from .enums import (
     Action, Side, Regime, OrderType, OrderStatus, RiskLevel
 )
+from .state_lock import StateManager, state_manager, StateLock
 
 __all__ = [
     "MarketState",
@@ -22,4 +23,7 @@ __all__ = [
     "OrderType",
     "OrderStatus",
     "RiskLevel",
+    "StateManager",
+    "state_manager",
+    "StateLock",
 ]

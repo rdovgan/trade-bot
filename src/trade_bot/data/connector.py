@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import ccxt.async_support as ccxt
 
@@ -86,7 +87,9 @@ class CCXTConnector(DataConnector):
         
         # Initialize exchange
         is_sandbox = self.config.get('sandbox', False)
-        default_type = 'linear'
+        # Binance uses 'future', Bybit/OKX use 'linear'
+        type_map = {'binance': 'future', 'binanceusdm': 'future'}
+        default_type = type_map.get(exchange_name, 'linear')
         ccxt_keys = {k: v for k, v in self.config.items() if k != 'sandbox'}
         exchange_class = getattr(ccxt, exchange_name)
         self.exchange = exchange_class({
@@ -202,6 +205,27 @@ class CCXTConnector(DataConnector):
             logger.error(f"Error loading markets: {e}")
             raise
 
+    async def get_funding_rate(self, symbol: str) -> float:
+        """Get current funding rate for perpetual."""
+        try:
+            if hasattr(self.exchange, 'fetch_funding_rate'):
+                funding = await self.exchange.fetch_funding_rate(symbol)
+                return float(funding.get('fundingRate', 0))
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error fetching funding rate for {symbol}: {e}")
+            return 0.0
+
+    async def get_funding_rate_history(self, symbol: str, since: int, limit: int = 100) -> List[Dict]:
+        """Get funding rate history."""
+        try:
+            if hasattr(self.exchange, 'fetch_funding_rate_history'):
+                return await self.exchange.fetch_funding_rate_history(symbol, since=since, limit=limit)
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching funding history for {symbol}: {e}")
+            return []
+
     async def close(self):
         """Close exchange connection."""
         await self.exchange.close()
@@ -307,17 +331,76 @@ class MarketDataProcessor:
             return Regime.TRENDING
         else:
             return Regime.MEAN_REVERT
-    
+
+    def _validate_ohlcv_freshness(self, ohlcv: pd.DataFrame, timeframe: str) -> bool:
+        """Validate that market data is fresh."""
+        if ohlcv.empty:
+            return False
+
+        latest_timestamp = ohlcv.index[-1]
+        now = datetime.now()
+
+        # Map timeframe to max acceptable age
+        max_age_seconds = {
+            '1m': 120,   # 2 minutes
+            '5m': 600,   # 10 minutes
+            '15m': 1800, # 30 minutes
+            '1h': 7200,  # 2 hours
+        }.get(timeframe, 300)
+
+        age = (now - latest_timestamp).total_seconds()
+
+        if age > max_age_seconds:
+            logger.warning(f"Market data is stale: age={age:.0f}s, max={max_age_seconds}s")
+            return False
+
+        return True
+
+    def _validate_ohlcv_data(self, ohlcv: pd.DataFrame) -> bool:
+        """Validate OHLCV data quality."""
+        if ohlcv.empty:
+            return False
+
+        # Check for NaN/inf
+        if ohlcv.isnull().any().any() or np.isinf(ohlcv.values).any():
+            logger.error("OHLCV contains NaN or inf values")
+            return False
+
+        # Check for zero/negative prices
+        price_cols = ['open', 'high', 'low', 'close']
+        if (ohlcv[price_cols] <= 0).any().any():
+            logger.error("OHLCV contains zero or negative prices")
+            return False
+
+        # Check for time gaps
+        try:
+            expected_interval = pd.infer_freq(ohlcv.index)
+            if expected_interval is None:
+                logger.warning("Cannot infer OHLCV frequency - possible gaps")
+        except Exception as e:
+            logger.warning(f"Could not check OHLCV frequency: {e}")
+
+        return True
+
     async def create_market_state(
         self,
         symbol: str,
         connector: DataConnector,
         timeframe: str = '1m'
     ) -> MarketState:
-        """Create comprehensive market state."""
+        """Create comprehensive market state with validation."""
         try:
             # Get market data
             ohlcv = await connector.get_ohlcv(symbol, timeframe, limit=200)
+
+            # Validate data quality
+            if not self._validate_ohlcv_data(ohlcv):
+                raise ValueError(f"Invalid OHLCV data for {symbol}")
+
+            # Validate freshness
+            if not self._validate_ohlcv_freshness(ohlcv, timeframe):
+                raise ValueError(f"Stale market data for {symbol}")
+
             ticker = await connector.get_ticker(symbol)
             order_book = await connector.get_order_book(symbol)
             

@@ -14,6 +14,7 @@ load_dotenv()
 
 from .core.models import MarketState, PositionState, AccountState, RiskState, TradingAction
 from .core.enums import Action, Side, Regime
+from .core.state_lock import state_manager
 from .risk.validator import RiskValidator
 from .data.connector import CCXTConnector, DataManager
 from .signal.generator import create_default_signal_manager
@@ -52,7 +53,8 @@ class TradingBot:
                     defaults[key] = val
         self.config = defaults
         self._running = False
-        
+        self._funding_task: Optional[asyncio.Task] = None
+
         # Initialize components
         self._init_components()
         
@@ -142,7 +144,8 @@ class TradingBot:
             self.position_monitor = PositionMonitor(self.exchange_connector)
             self.execution_engine = ExecutionEngine(
                 self.exchange_connector,
-                self.position_monitor
+                self.position_monitor,
+                journal=self.journal
             )
 
             # Initialize learning system
@@ -168,10 +171,12 @@ class TradingBot:
             )
 
             # Peak equity tracking for drawdown calculation
-            self._peak_equity: float = self.account_state.equity
-            self._day_start_equity: float = self.account_state.equity
+            # These start as None and get set on first successful balance fetch
+            self._peak_equity: Optional[float] = None
+            self._day_start_equity: Optional[float] = None
             self._current_day: Optional[datetime] = None
-            
+            self._system_locked: bool = self._load_lock_state()
+
             logger.info("All components initialized successfully")
             
         except Exception as e:
@@ -182,17 +187,37 @@ class TradingBot:
         """Start the trading bot."""
         try:
             logger.info("Starting trading bot...")
-            
+
             # Start data collection
             await self.data_manager.start()
-            
+
+            # Fetch real balance before anything else
+            balance = await self.exchange_connector.get_balance()
+            total_balance = sum(balance.values())
+            logger.info(f"Exchange balance at startup: {balance} (total: {total_balance:.2f})")
+
+            if total_balance <= 0:
+                logger.critical("Account balance is zero — cannot start trading")
+                return
+
+            self.account_state.balance = total_balance
+            self.account_state.equity = total_balance
+            self._peak_equity = total_balance
+            self._day_start_equity = total_balance
+
             # Start position monitoring
             symbols = self.config['trading']['symbols']
             await self.position_monitor.start_monitoring(symbols)
-            
+
+            # Start order monitoring (for stop-loss fills)
+            await self.execution_engine.start_monitoring()
+
             # Set running flag
             self._running = True
-            
+
+            # Start funding cost accumulation task
+            self._funding_task = asyncio.create_task(self._accumulate_funding_costs())
+
             # Start main trading loop
             await self._trading_loop()
             
@@ -204,15 +229,24 @@ class TradingBot:
         """Stop the trading bot."""
         try:
             logger.info("Stopping trading bot...")
-            
+
             self._running = False
-            
+
+            # Stop funding cost task
+            if self._funding_task:
+                self._funding_task.cancel()
+                try:
+                    await self._funding_task
+                except asyncio.CancelledError:
+                    pass
+
             # Cancel all pending orders
             await self.execution_engine.cancel_all_orders()
             
             # Stop components
             await self.data_manager.stop()
             await self.position_monitor.stop_monitoring()
+            await self.execution_engine.stop_monitoring()
             await self.execution_engine.close()
             
             logger.info("Trading bot stopped")
@@ -258,11 +292,17 @@ class TradingBot:
         """Main trading loop."""
         user_symbols = self.config['trading']['symbols']
         timeframe = self.config['trading']['timeframe']
+        loop_count = 0
 
         logger.info(f"Starting trading loop for {len(user_symbols)} user symbols")
 
         while self._running:
             try:
+                if self._system_locked:
+                    logger.warning("System is locked — no trading until manual restart")
+                    await asyncio.sleep(60)
+                    continue
+
                 # Run market scan if enabled
                 await self._run_market_scan()
 
@@ -271,10 +311,19 @@ class TradingBot:
 
                 # Process each symbol
                 for symbol in all_symbols:
+                    if self._system_locked:
+                        break
                     await self._process_symbol(symbol, timeframe)
 
                 # Update daily performance
                 await self._update_daily_performance()
+
+                # Periodic position reconciliation (every 5 minutes)
+                loop_count += 1
+                if loop_count % 5 == 0:
+                    discrepancies = await self.execution_engine.reconcile_positions()
+                    if discrepancies:
+                        logger.warning(f"Position discrepancies found: {discrepancies}")
 
                 # Wait before next iteration
                 await asyncio.sleep(60)  # Process every minute
@@ -286,8 +335,12 @@ class TradingBot:
     async def _process_symbol(self, symbol: str, timeframe: str):
         """Process a single trading symbol."""
         try:
-            # Get market state
-            market_state = await self.data_manager.get_market_state(symbol, timeframe)
+            # Get market state with validation
+            try:
+                market_state = await self.data_manager.get_market_state(symbol, timeframe)
+            except ValueError as e:
+                logger.warning(f"Skipping {symbol}: {e}")
+                return  # Skip this symbol if data is invalid
             
             # Get position state
             position_state = self.position_monitor.get_position(symbol) or PositionState()
@@ -325,19 +378,20 @@ class TradingBot:
                 await self._close_position(symbol, market_state)
                 return
             
-            # Make trading decision
-            all_positions = self.position_monitor.get_all_positions()
-            active_count = sum(
-                1 for p in all_positions.values() if p.current_side != Side.FLAT
-            )
-            action = await self.decision_engine.make_decision(
-                market_state, position_state, self.account_state, risk_state,
-                active_positions=active_count,
-            )
-            
-            # Execute action if not HOLD
-            if action and action.action.value != 'HOLD':
-                await self._execute_action(action, symbol, market_state)
+            # Make trading decision and execute with locking to prevent concurrent approvals
+            async with state_manager.lock_state("risk_validation"):
+                all_positions = self.position_monitor.get_all_positions()
+                active_count = sum(
+                    1 for p in all_positions.values() if p.current_side != Side.FLAT
+                )
+                action = await self.decision_engine.make_decision(
+                    market_state, position_state, self.account_state, risk_state,
+                    active_positions=active_count,
+                )
+
+                # Execute action if not HOLD
+                if action and action.action.value != 'HOLD':
+                    await self._execute_action(action, symbol, market_state)
             
         except Exception as e:
             logger.error(f"Error processing symbol {symbol}: {e}")
@@ -376,10 +430,14 @@ class TradingBot:
             )
             
             # Execute close
-            await self.execution_engine.execute_action(
+            order = await self.execution_engine.execute_action(
                 close_action, symbol, market_state.current_price
             )
-            
+
+            # Complete the trade
+            if order:
+                await self.execution_engine.complete_trade_on_manual_close(symbol, order)
+
             logger.info(f"Closed position for {symbol}")
             
         except Exception as e:
@@ -387,84 +445,97 @@ class TradingBot:
     
     async def _update_account_state(self):
         """Update account state from exchange."""
-        try:
-            # Get balance from exchange
-            balance = await self.exchange_connector.get_balance()
+        async with state_manager.lock_state("account"):
+            try:
+                # Get balance from exchange
+                balance = await self.exchange_connector.get_balance()
 
-            # Calculate unrealized PnL across all positions
-            all_positions = self.position_monitor.get_all_positions()
-            total_unrealized_pnl = sum(
-                pos.unrealized_pnl for pos in all_positions.values()
-                if pos.current_side != Side.FLAT
-            )
-            self.account_state.unrealized_pnl = total_unrealized_pnl
-
-            # Calculate total exposure across all positions
-            total_exposure = 0.0
-            for pos in all_positions.values():
-                if pos.current_side != Side.FLAT and pos.entry_price:
-                    total_exposure += abs(pos.position_size * pos.entry_price)
-
-            # Update balance and equity
-            total_balance = sum(balance.values())
-            self.account_state.balance = total_balance
-            self.account_state.equity = total_balance + total_unrealized_pnl
-
-            # Update exposure and leverage
-            if self.account_state.equity > 0:
-                self.account_state.exposure_pct = total_exposure / self.account_state.equity
-                self.account_state.leverage = total_exposure / self.account_state.equity
-            else:
-                self.account_state.exposure_pct = 0.0
-                self.account_state.leverage = 0.0
-
-            # Reset day-start equity at day boundary
-            today = datetime.now().date()
-            if self._current_day is None or self._current_day != today:
-                self._current_day = today
-                self._day_start_equity = self.account_state.equity
-                logger.info(f"New trading day — start equity: {self._day_start_equity:.2f}")
-
-            # Update peak equity (high-water mark)
-            if self.account_state.equity > self._peak_equity:
-                self._peak_equity = self.account_state.equity
-
-            # Calculate current drawdown from peak
-            if self._peak_equity > 0:
-                self.account_state.current_drawdown = (
-                    (self._peak_equity - self.account_state.equity) / self._peak_equity
+                # Calculate unrealized PnL across all positions
+                all_positions = self.position_monitor.get_all_positions()
+                total_unrealized_pnl = sum(
+                    pos.unrealized_pnl for pos in all_positions.values()
+                    if pos.current_side != Side.FLAT
                 )
-            else:
-                self.account_state.current_drawdown = 0.0
+                self.account_state.unrealized_pnl = total_unrealized_pnl
 
-            # Track max drawdown
-            if self.account_state.current_drawdown > self.account_state.max_drawdown:
-                self.account_state.max_drawdown = self.account_state.current_drawdown
+                # Calculate total exposure across all positions
+                total_exposure = 0.0
+                for pos in all_positions.values():
+                    if pos.current_side != Side.FLAT and pos.entry_price:
+                        total_exposure += abs(pos.position_size * pos.entry_price)
 
-            # Calculate daily loss (including unrealized PnL)
-            if self._day_start_equity > 0:
-                daily_change = self.account_state.equity - self._day_start_equity
+                # Update balance and equity
+                total_balance = sum(balance.values())
+                self.account_state.balance = total_balance
+                equity = total_balance + total_unrealized_pnl
+                self.account_state.equity = equity
+
+                # Skip drawdown calculations if equity is zero or negative
+                # (exchange may return 0 balance during API issues)
+                if equity <= 0:
+                    logger.warning(f"Equity is {equity:.2f} — skipping drawdown calculation")
+                    self.account_state.exposure_pct = 0.0
+                    self.account_state.leverage = 0.0
+                    return
+
+                # Update exposure and leverage
+                self.account_state.exposure_pct = total_exposure / equity
+                self.account_state.leverage = total_exposure / equity
+
+                # Initialize peak/day-start equity on first valid balance
+                if self._peak_equity is None:
+                    self._peak_equity = equity
+                    logger.info(f"Initial peak equity set to {equity:.2f}")
+                if self._day_start_equity is None:
+                    self._day_start_equity = equity
+                    logger.info(f"Initial day-start equity set to {equity:.2f}")
+
+                # Reset day-start equity at day boundary
+                today = datetime.now().date()
+                if self._current_day is None or self._current_day != today:
+                    self._current_day = today
+                    self._day_start_equity = equity
+                    logger.info(f"New trading day — start equity: {self._day_start_equity:.2f}")
+
+                # Update peak equity (high-water mark)
+                if equity > self._peak_equity:
+                    self._peak_equity = equity
+
+                # Calculate current drawdown from peak
+                self.account_state.current_drawdown = (
+                    (self._peak_equity - equity) / self._peak_equity
+                )
+
+                # Track max drawdown
+                if self.account_state.current_drawdown > self.account_state.max_drawdown:
+                    self.account_state.max_drawdown = self.account_state.current_drawdown
+
+                # Calculate daily loss (including unrealized PnL)
+                daily_change = equity - self._day_start_equity
                 self.account_state.daily_pnl = daily_change
                 self.account_state.daily_loss_pct = max(0.0, -daily_change / self._day_start_equity)
-            else:
-                self.account_state.daily_pnl = 0.0
-                self.account_state.daily_loss_pct = 0.0
 
-            # Emergency: if drawdown exceeds lock threshold, close all positions
-            lock_threshold = self.risk_validator.config.get("drawdown_lock_threshold", 0.20)
-            if self.account_state.current_drawdown >= lock_threshold:
-                logger.critical(
-                    f"EMERGENCY: Drawdown {self.account_state.current_drawdown:.2%} "
-                    f"exceeds lock threshold {lock_threshold:.2%} — closing all positions"
-                )
-                await self._emergency_close_all()
+                # Emergency: if drawdown exceeds lock threshold, close all and lock
+                lock_threshold = self.risk_validator.config.get("drawdown_lock_threshold", 0.10)
+                if not self._system_locked and self.account_state.current_drawdown >= lock_threshold:
+                    logger.critical(
+                        f"EMERGENCY: Drawdown {self.account_state.current_drawdown:.2%} "
+                        f"exceeds lock threshold {lock_threshold:.2%} — closing all positions and locking system"
+                    )
+                    await self._emergency_close_all()
+                    self._system_locked = True
 
-        except Exception as e:
-            logger.error(f"Error updating account state: {e}")
+            except Exception as e:
+                logger.error(f"Error updating account state: {e}")
 
     async def _emergency_close_all(self):
-        """Emergency close all open positions when drawdown lock triggers."""
+        """Emergency close all open positions with proper order cleanup."""
         try:
+            # 1. Cancel ALL pending orders first
+            logger.critical("Cancelling all pending orders...")
+            await self.execution_engine.cancel_all_orders()
+
+            # 2. Close all positions
             all_positions = self.position_monitor.get_all_positions()
             for symbol, position in all_positions.items():
                 if position.current_side != Side.FLAT:
@@ -483,9 +554,64 @@ class TradingBot:
                         )
                     except Exception as e:
                         logger.error(f"Failed to emergency close {symbol}: {e}")
+
+            # 3. Set lock flag and persist
+            self._system_locked = True
+            self._persist_lock_state(True)
+
         except Exception as e:
             logger.error(f"Error in emergency close all: {e}")
-    
+
+    def _persist_lock_state(self, locked: bool):
+        """Persist system lock to file."""
+        import json
+        lock_file = Path("trade_bot_lock.json")
+        lock_file.write_text(json.dumps({
+            "locked": locked,
+            "timestamp": datetime.now().isoformat(),
+            "reason": "emergency_drawdown"
+        }))
+        logger.info(f"Persisted lock state: locked={locked}")
+
+    def _load_lock_state(self) -> bool:
+        """Load lock state on startup."""
+        import json
+        lock_file = Path("trade_bot_lock.json")
+        if lock_file.exists():
+            data = json.loads(lock_file.read_text())
+            if data.get("locked"):
+                logger.warning(f"System was locked at {data.get('timestamp')}")
+                return True
+        return False
+
+    async def _accumulate_funding_costs(self):
+        """Background task to track funding rate costs every 8 hours."""
+        while self._running:
+            try:
+                all_positions = self.position_monitor.get_all_positions()
+
+                for symbol, position in all_positions.items():
+                    if position.current_side != Side.FLAT:
+                        # Get funding rate
+                        funding_rate = await self.data_connector.get_funding_rate(symbol)
+
+                        # Calculate funding cost
+                        notional = abs(position.position_size * position.entry_price) if position.entry_price else 0
+                        funding_cost = notional * funding_rate
+
+                        # Find open trade and add to funding_cost
+                        open_trade = next((t for t in self.execution_engine._trades
+                                         if t.symbol == symbol and t.status == "open"), None)
+                        if open_trade:
+                            open_trade.funding_cost += funding_cost
+                            logger.info(f"Accumulated funding cost for {symbol}: ${funding_cost:.4f} (rate: {funding_rate:.6f})")
+
+                # Wait 8 hours (28800 seconds)
+                await asyncio.sleep(28800)
+            except Exception as e:
+                logger.error(f"Error accumulating funding costs: {e}")
+                await asyncio.sleep(3600)  # Retry in 1 hour on error
+
     async def _update_daily_performance(self):
         """Update daily performance metrics."""
         try:

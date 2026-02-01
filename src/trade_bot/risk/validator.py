@@ -42,18 +42,18 @@ class RiskValidator:
             "max_risk_per_trade_absolute": 0.02,  # 2% absolute maximum
             
             # Exposure limits
-            "max_exposure_per_asset": 0.15,  # 15% per asset
-            "max_total_exposure": 0.30,  # 30% total exposure
-            "max_leverage": 1.5,  # Maximum 1.5x leverage
-
+            "max_exposure_per_asset": 0.30,  # 30% per asset (as per plan.md)
+            "max_total_exposure": 0.50,  # 50% total exposure (as per plan.md)
+            "max_leverage": 2.0,  # Maximum 2x leverage (as per plan.md)
+            
             # Daily risk limits
-            "max_daily_loss": 0.03,  # 3% daily loss limit
-            "max_consecutive_losses": 3,  # 3 consecutive trades
-
+            "max_daily_loss": 0.05,  # 5% daily loss limit (as per plan.md)
+            "max_consecutive_losses": 5,  # 5 consecutive trades (as per plan.md)
+            
             # Drawdown controls
-            "drawdown_reduction_threshold": 0.05,  # 5% DD -> 50% size reduction
-            "drawdown_pause_threshold": 0.08,  # 8% DD -> trading pause
-            "drawdown_lock_threshold": 0.10,  # 10% DD -> system lock + close all
+            "drawdown_reduction_threshold": 0.10,  # 10% DD -> 50% size reduction (as per plan.md)
+            "drawdown_pause_threshold": 0.15,  # 15% DD -> trading pause (as per plan.md)
+            "drawdown_lock_threshold": 0.20,  # 20% DD -> system lock (as per plan.md)
             
             # Volatility guards
             "volatility_guard_threshold": 95,  # 95th percentile
@@ -64,10 +64,10 @@ class RiskValidator:
             "mandatory_stop_loss": True,  # Stop loss is mandatory
             "no_averaging_down": True,  # No averaging down allowed
             "no_martingale": True,  # No martingale strategy
-
+            
             # Red days control
             "max_red_days": 3,  # 3 consecutive red days -> safe mode
-
+            
             # Max concurrent positions (scanner)
             "max_positions": 3,
         }
@@ -330,34 +330,52 @@ class RiskValidator:
             confidence: Decision confidence (0-1)
         
         Returns:
-            Recommended position size
+            Recommended position size in base currency units
         """
         
-        # Base position size from risk per trade
-        # risk_amount is in quote currency (USDT), stop_distance is in price units
-        # size = risk_amount / stop_distance gives base currency units
-        # Cap notional value to max_exposure_per_asset * equity
+        # Validate inputs
+        if account_state.equity <= 0 or stop_distance <= 0 or market_state.current_price <= 0:
+            return 0.0
+        
+        # Calculate risk amount (fixed % of equity)
         risk_amount = account_state.equity * self.config["max_risk_per_trade"]
-        base_size = risk_amount / stop_distance if stop_distance > 0 else 0
-
-        # Cap by max exposure
-        if market_state.current_price > 0:
-            max_notional = account_state.equity * self.config["max_exposure_per_asset"]
-            max_size = max_notional / market_state.current_price
-            base_size = min(base_size, max_size)
+        
+        # Calculate base position size: risk_amount / stop_distance
+        # This gives us the size in base currency units
+        base_size = risk_amount / stop_distance
+        
+        # Calculate notional value of base_size
+        notional_value = base_size * market_state.current_price
+        
+        # Cap by maximum exposure per asset
+        max_notional = account_state.equity * self.config["max_exposure_per_asset"]
+        if notional_value > max_notional:
+            base_size = max_notional / market_state.current_price
         
         # Adjust for confidence
-        size = base_size * confidence
+        adjusted_size = base_size * confidence
         
-        # Adjust for drawdown
+        # Adjust for drawdown (if applicable)
         if account_state.current_drawdown >= self.config["drawdown_reduction_threshold"]:
-            size *= 0.5  # 50% reduction
+            adjusted_size *= 0.5  # 50% reduction
         
         # Adjust for safe mode
         # This would be set based on risk_state.safe_mode_active
         # Implementation depends on how safe mode is triggered
         
-        return max(0, size)
+        # Final validation
+        if adjusted_size <= 0:
+            return 0.0
+        
+        # Log calculation details for debugging
+        logger.debug(
+            f"Position sizing: equity={account_state.equity:.2f}, "
+            f"risk_pct={self.config['max_risk_per_trade']:.2%}, "
+            f"risk_amount={risk_amount:.2f}, stop_distance={stop_distance:.4f}, "
+            f"base_size={base_size:.6f}, adjusted_size={adjusted_size:.6f}"
+        )
+        
+        return adjusted_size
     
     def update_risk_state(
         self,

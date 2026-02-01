@@ -183,3 +183,9 @@ class Trade(BaseModel):
     liquidity_score: float = Field(description="Liquidity score")
     slippage: float = Field(default=0.0, description="Slippage in basis points")
     confidence: float = Field(description="Decision confidence")
+
+    # Status and costs
+    status: str = Field(default="open", description="Trade status: open, closed")
+    funding_cost: float = Field(default=0.0, description="Total funding rate costs")
+    commission_entry: float = Field(default=0.0, description="Entry commission")
+    commission_exit: float = Field(default=0.0, description="Exit commission")

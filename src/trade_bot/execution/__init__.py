@@ -6,10 +6,15 @@ from .engine import (
     PositionMonitor,
     ExecutionEngine
 )
+from .slippage import SlippageProtector, SlippageAnalysis
+from .emergency import EmergencyManager
 
 __all__ = [
     "ExchangeConnector",
     "CCXTExchangeConnector",
     "PositionMonitor", 
     "ExecutionEngine",
+    "SlippageProtector",
+    "SlippageAnalysis",
+    "EmergencyManager",
 ]
