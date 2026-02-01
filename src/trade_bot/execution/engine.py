@@ -209,14 +209,14 @@ class CCXTExchangeConnector(ExchangeConnector):
                 positions = await self.exchange.fetch_positions()
                 return [
                     {
-                        'symbol': pos.get('symbol', ''),
-                        'side': pos.get('side', ''),
-                        'size': pos.get('contracts', 0),
-                        'entry_price': pos.get('entryPrice', 0),
-                        'unrealized_pnl': pos.get('unrealizedPnl', 0),
+                        'symbol': pos.get('symbol') or '',
+                        'side': pos.get('side') or '',
+                        'size': float(pos.get('contracts') or 0),
+                        'entry_price': float(pos.get('entryPrice') or 0),
+                        'unrealized_pnl': float(pos.get('unrealizedPnl') or 0),
                     }
                     for pos in positions
-                    if float(pos.get('contracts', 0)) != 0
+                    if float(pos.get('contracts') or 0) != 0
                 ]
             else:
                 return []
