@@ -42,18 +42,18 @@ class RiskValidator:
             "max_risk_per_trade_absolute": 0.02,  # 2% absolute maximum
             
             # Exposure limits
-            "max_exposure_per_asset": 0.30,  # 30% per asset
-            "max_total_exposure": 0.50,  # 50% total exposure
-            "max_leverage": 2.0,  # Maximum 2x leverage
-            
+            "max_exposure_per_asset": 0.15,  # 15% per asset
+            "max_total_exposure": 0.30,  # 30% total exposure
+            "max_leverage": 1.5,  # Maximum 1.5x leverage
+
             # Daily risk limits
-            "max_daily_loss": 0.05,  # 5% daily loss limit
-            "max_consecutive_losses": 5,  # 5 consecutive trades
-            
+            "max_daily_loss": 0.03,  # 3% daily loss limit
+            "max_consecutive_losses": 3,  # 3 consecutive trades
+
             # Drawdown controls
-            "drawdown_reduction_threshold": 0.10,  # 10% DD -> 50% size reduction
-            "drawdown_pause_threshold": 0.15,  # 15% DD -> trading pause
-            "drawdown_lock_threshold": 0.20,  # 20% DD -> system lock
+            "drawdown_reduction_threshold": 0.05,  # 5% DD -> 50% size reduction
+            "drawdown_pause_threshold": 0.08,  # 8% DD -> trading pause
+            "drawdown_lock_threshold": 0.10,  # 10% DD -> system lock + close all
             
             # Volatility guards
             "volatility_guard_threshold": 95,  # 95th percentile
@@ -69,7 +69,7 @@ class RiskValidator:
             "max_red_days": 3,  # 3 consecutive red days -> safe mode
 
             # Max concurrent positions (scanner)
-            "max_positions": 5,
+            "max_positions": 3,
         }
     
     def validate_trading_action(
@@ -80,12 +80,14 @@ class RiskValidator:
         account_state: AccountState,
         risk_state: RiskState,
         active_positions: int = 0,
+        total_exposure_pct: float = 0.0,
     ) -> Tuple[bool, Optional[str]]:
         """
         Validate a trading action against all risk rules.
 
         Args:
             active_positions: Number of currently open positions (used for max_positions check).
+            total_exposure_pct: Total portfolio exposure as fraction of equity across ALL positions.
 
         Returns:
             Tuple of (is_valid, rejection_reason)
@@ -106,17 +108,17 @@ class RiskValidator:
             if action.action in [Action.BUY, Action.SELL]:
                 self._validate_new_position(action, market_state, position_state, account_state, risk_state)
             
+            # Validate stop loss (must come before position sizing)
+            self._validate_stop_loss(action)
+
             # Validate position sizing
-            self._validate_position_size(action, account_state, risk_state)
-            
+            self._validate_position_size(action, account_state, risk_state, market_state)
+
             # Validate risk:reward ratio
             self._validate_risk_reward_ratio(action)
             
-            # Validate stop loss
-            self._validate_stop_loss(action)
-            
             # Check exposure limits
-            self._validate_exposure_limits(action, position_state, account_state)
+            self._validate_exposure_limits(action, position_state, account_state, market_state, total_exposure_pct)
             
             # Check market conditions
             self._validate_market_conditions(action, market_state)
@@ -169,23 +171,29 @@ class RiskValidator:
         action: TradingAction,
         account_state: AccountState,
         risk_state: RiskState,
+        market_state: Optional[MarketState] = None,
     ):
         """Validate position sizing rules."""
-        
+
         if action.action not in [Action.BUY, Action.SELL]:
             return
-        
-        # Calculate risk amount
-        if action.stop_loss:
-            risk_amount = action.size * abs(action.stop_loss - action.expected_return)
+
+        # Calculate risk amount: size * distance from entry to stop loss
+        if action.stop_loss and market_state:
+            stop_distance = abs(market_state.current_price - action.stop_loss)
+            risk_amount = action.size * stop_distance
             risk_pct = risk_amount / account_state.equity if account_state.equity > 0 else 1.0
+        elif action.stop_loss and action.expected_risk > 0:
+            # Fallback: use expected_risk as % of position notional
+            risk_pct = action.expected_risk
         else:
-            risk_pct = 0
-        
+            # No stop loss — treat as maximum risk (full position notional)
+            risk_pct = 1.0
+
         # Check risk per trade limits
         if risk_pct > self.config["max_risk_per_trade_absolute"]:
             raise RiskViolation(f"Risk per trade {risk_pct:.2%} exceeds maximum {self.config['max_risk_per_trade_absolute']:.2%}")
-        
+
         if risk_pct > self.config["max_risk_per_trade"]:
             logger.warning(f"Risk per trade {risk_pct:.2%} exceeds recommended {self.config['max_risk_per_trade']:.2%}")
     
@@ -215,25 +223,37 @@ class RiskValidator:
         self,
         action: TradingAction,
         position_state: PositionState,
-        account_state: AccountState
+        account_state: AccountState,
+        market_state: MarketState,
+        total_exposure_pct: float = 0.0,
     ):
         """Validate exposure limits."""
-        
+
         if action.action not in [Action.BUY, Action.SELL]:
             return
-        
-        # Calculate new total exposure
-        current_exposure = abs(position_state.position_size * position_state.entry_price) if position_state.position_size and position_state.entry_price else 0
-        new_exposure = current_exposure + (action.size * action.expected_return)
-        new_exposure_pct = new_exposure / account_state.equity if account_state.equity > 0 else 1.0
-        
+
+        price = market_state.current_price
+
+        # Per-asset exposure: existing position + new order
+        current_asset_exposure = abs(position_state.position_size * position_state.entry_price) if position_state.position_size and position_state.entry_price else 0
+        new_order_notional = action.size * price
+        new_asset_exposure = current_asset_exposure + new_order_notional
+        new_asset_exposure_pct = new_asset_exposure / account_state.equity if account_state.equity > 0 else 1.0
+
+        # Check per-asset exposure limit
+        if new_asset_exposure_pct > self.config["max_exposure_per_asset"]:
+            raise RiskViolation(f"Per-asset exposure {new_asset_exposure_pct:.2%} exceeds maximum {self.config['max_exposure_per_asset']:.2%}")
+
+        # Total portfolio exposure: all existing positions + this new order
+        new_total_exposure_pct = total_exposure_pct + (new_order_notional / account_state.equity if account_state.equity > 0 else 1.0)
+
         # Check total exposure limit
-        if new_exposure_pct > self.config["max_total_exposure"]:
-            raise RiskViolation(f"Total exposure {new_exposure_pct:.2%} exceeds maximum {self.config['max_total_exposure']:.2%}")
-        
+        if new_total_exposure_pct > self.config["max_total_exposure"]:
+            raise RiskViolation(f"Total exposure {new_total_exposure_pct:.2%} exceeds maximum {self.config['max_total_exposure']:.2%}")
+
         # Check leverage limit
-        if new_exposure_pct > self.config["max_leverage"]:
-            raise RiskViolation(f"Leverage {new_exposure_pct:.2f}x exceeds maximum {self.config['max_leverage']:.1f}x")
+        if new_total_exposure_pct > self.config["max_leverage"]:
+            raise RiskViolation(f"Leverage {new_total_exposure_pct:.2f}x exceeds maximum {self.config['max_leverage']:.1f}x")
     
     def _validate_market_conditions(self, action: TradingAction, market_state: MarketState):
         """Validate market condition guards."""
@@ -289,12 +309,9 @@ class RiskValidator:
         
         # Position size reduction
         if dd >= self.config["drawdown_reduction_threshold"]:
-            # Allow trading but at reduced size
-            max_size_pct = self.config["max_risk_per_trade"] * 0.5  # 50% reduction
-            if action.stop_loss:
-                risk_pct = (action.size * action.stop_loss) / account_state.equity if account_state.equity > 0 else 1.0
-                if risk_pct > max_size_pct:
-                    raise RiskViolation(f"Position size must be reduced due to drawdown: max {max_size_pct:.2%}")
+            # Allow trading but at reduced size — halve the normal risk budget
+            max_risk_pct = self.config["max_risk_per_trade"] * 0.5  # 50% reduction
+            logger.warning(f"Drawdown {dd:.2%} — reducing max risk per trade to {max_risk_pct:.2%}")
     
     def calculate_position_size(
         self,

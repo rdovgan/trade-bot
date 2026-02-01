@@ -157,7 +157,7 @@ class TestRiskValidator:
     def test_validate_daily_loss_limit(self):
         """Test rejection when daily loss limit is reached."""
         # Set daily loss to exceed limit
-        self.account_state.daily_loss_pct = 0.06  # 6% > 5% limit
+        self.account_state.daily_loss_pct = 0.04  # 4% > 3% limit
         
         action = TradingAction(
             action=Action.BUY,
@@ -180,7 +180,7 @@ class TestRiskValidator:
     def test_validate_drawdown_pause(self):
         """Test rejection when drawdown triggers pause."""
         # Set drawdown to trigger pause
-        self.account_state.current_drawdown = 0.16  # 16% > 15% threshold
+        self.account_state.current_drawdown = 0.09  # 9% > 8% threshold
         
         action = TradingAction(
             action=Action.BUY,
@@ -294,31 +294,31 @@ class TestRiskValidator:
     
     def test_calculate_position_size(self):
         """Test position size calculation."""
-        stop_distance = 2.0  # 2% stop loss
-        
+        stop_distance = 2.0  # $2 stop distance
+
         size = self.validator.calculate_position_size(
             self.account_state, self.market_state, stop_distance
         )
-        
+
         # Expected: 1% of 10000 = 100 risk amount
         # risk-based size = 100 / 2 = 50
-        # exposure cap = 30% * 10000 / 100 = 30
-        expected_size = 30.0
+        # exposure cap = 15% * 10000 / 100 = 15
+        expected_size = 15.0
         assert abs(size - expected_size) < 0.01
-    
+
     def test_calculate_position_size_with_drawdown(self):
         """Test position size calculation with drawdown reduction."""
         # Set drawdown to trigger reduction
-        self.account_state.current_drawdown = 0.12  # 12% > 10% threshold
-        
+        self.account_state.current_drawdown = 0.06  # 6% > 5% threshold
+
         stop_distance = 2.0
-        
+
         size = self.validator.calculate_position_size(
             self.account_state, self.market_state, stop_distance
         )
-        
-        # Exposure cap = 30% * 10000 / 100 = 30, then 50% drawdown reduction = 15
-        expected_size = 15.0
+
+        # Exposure cap = 15% * 10000 / 100 = 15, then 50% drawdown reduction = 7.5
+        expected_size = 7.5
         assert abs(size - expected_size) < 0.01
     
     def test_update_risk_state(self):
@@ -339,7 +339,7 @@ class TestRiskValidator:
     def test_update_risk_state_with_drawdown(self):
         """Test risk state update with high drawdown."""
         # Set high drawdown
-        self.account_state.current_drawdown = 0.16  # 16% > 15% threshold
+        self.account_state.current_drawdown = 0.09  # 9% > 8% threshold
         
         risk_state = self.validator.update_risk_state(
             self.account_state, self.market_state, []
@@ -368,8 +368,8 @@ class TestRiskValidator:
         assert "Averaging down" in reason
 
     def test_validate_drawdown_lock(self):
-        """Test system lock at 20% drawdown."""
-        self.account_state.current_drawdown = 0.21
+        """Test system lock at 10% drawdown."""
+        self.account_state.current_drawdown = 0.11
         action = TradingAction(
             action=Action.BUY, size=1.0, stop_loss=98.0, take_profit=104.0,
             expected_return=4.0, expected_risk=2.0, confidence=0.8,
@@ -383,7 +383,7 @@ class TestRiskValidator:
 
     def test_validate_consecutive_losses(self):
         """Test rejection at max consecutive losses."""
-        self.risk_state.consecutive_losses = 5
+        self.risk_state.consecutive_losses = 3
         action = TradingAction(
             action=Action.BUY, size=1.0, stop_loss=98.0, take_profit=104.0,
             expected_return=4.0, expected_risk=2.0, confidence=0.8,

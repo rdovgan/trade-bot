@@ -228,7 +228,8 @@ class DecisionEngine:
         market_state: MarketState,
         position_state: PositionState,
         account_state: AccountState,
-        risk_state: RiskState
+        risk_state: RiskState,
+        active_positions: int = 0,
     ) -> Optional[TradingAction]:
         """
         Make a trading decision based on all available information.
@@ -263,7 +264,9 @@ class DecisionEngine:
             # Step 5: Risk validation (hard gate)
             logger.info("Validating with risk engine...")
             is_valid, rejection_reason = self.risk_validator.validate_trading_action(
-                adjusted_signal, market_state, position_state, account_state, risk_state
+                adjusted_signal, market_state, position_state, account_state, risk_state,
+                active_positions=active_positions,
+                total_exposure_pct=account_state.exposure_pct,
             )
 
             if not is_valid:

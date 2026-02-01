@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from .core.models import MarketState, PositionState, AccountState, RiskState
-from .core.enums import Side, Regime
+from .core.models import MarketState, PositionState, AccountState, RiskState, TradingAction
+from .core.enums import Action, Side, Regime
 from .risk.validator import RiskValidator
 from .data.connector import CCXTConnector, DataManager
 from .signal.generator import create_default_signal_manager
@@ -78,7 +78,7 @@ class TradingBot:
             },
             'risk': {
                 'max_risk_per_trade': 0.01,  # 1%
-                'max_daily_loss': 0.05,      # 5%
+                'max_daily_loss': 0.03,      # 3%
             },
             'llm': {
                 'enabled': False,  # Disabled by default
@@ -88,8 +88,8 @@ class TradingBot:
                 'scan_interval_minutes': 15,
                 'quote_currency': 'USDT',
                 'min_volume_24h': 1_000_000,
-                'max_positions': 5,
-                'portfolio_pct': 0.50,
+                'max_positions': 3,
+                'portfolio_pct': 0.30,
                 'blacklist': [],
             },
         }
@@ -119,13 +119,13 @@ class TradingBot:
                 ccxt_config.copy()
             )
             self.data_manager = DataManager(self.data_connector)
-            
+
             # Initialize risk validator
             self.risk_validator = RiskValidator(self.config['risk'])
-            
+
             # Initialize signal manager
             self.signal_manager = create_default_signal_manager()
-            
+
             # Initialize decision engine
             self.llm_advisor = LLMAdvisor(self.config['llm'])
             self.decision_engine = DecisionEngine(
@@ -133,7 +133,7 @@ class TradingBot:
                 self.signal_manager,
                 self.llm_advisor
             )
-            
+
             # Initialize execution engine
             self.exchange_connector = CCXTExchangeConnector(
                 exchange_name,
@@ -144,7 +144,7 @@ class TradingBot:
                 self.exchange_connector,
                 self.position_monitor
             )
-            
+
             # Initialize learning system
             self.journal = TradeJournal()
             self.learning_loop = LearningLoop(self.journal)
@@ -160,12 +160,17 @@ class TradingBot:
             self.scanner = MarketScanner(scanner_cfg) if scanner_cfg.get('enabled') else None
             self._scanned_symbols: list = []
             self._last_scan_time: Optional[datetime] = None
-            
+
             # Initialize state
             self.account_state = AccountState(
                 equity=10000.0,  # Starting equity
                 balance=10000.0,
             )
+
+            # Peak equity tracking for drawdown calculation
+            self._peak_equity: float = self.account_state.equity
+            self._day_start_equity: float = self.account_state.equity
+            self._current_day: Optional[datetime] = None
             
             logger.info("All components initialized successfully")
             
@@ -321,8 +326,13 @@ class TradingBot:
                 return
             
             # Make trading decision
+            all_positions = self.position_monitor.get_all_positions()
+            active_count = sum(
+                1 for p in all_positions.values() if p.current_side != Side.FLAT
+            )
             action = await self.decision_engine.make_decision(
-                market_state, position_state, self.account_state, risk_state
+                market_state, position_state, self.account_state, risk_state,
+                active_positions=active_count,
             )
             
             # Execute action if not HOLD
@@ -357,9 +367,6 @@ class TradingBot:
                 return
             
             # Create closing action
-            from .core.models import TradingAction
-            from .core.enums import Action
-            
             close_action = TradingAction(
                 action=Action.SELL if position.current_side == Side.LONG else Action.BUY,
                 size=abs(position.position_size),
@@ -383,14 +390,101 @@ class TradingBot:
         try:
             # Get balance from exchange
             balance = await self.exchange_connector.get_balance()
-            
-            # Update account state (simplified)
+
+            # Calculate unrealized PnL across all positions
+            all_positions = self.position_monitor.get_all_positions()
+            total_unrealized_pnl = sum(
+                pos.unrealized_pnl for pos in all_positions.values()
+                if pos.current_side != Side.FLAT
+            )
+            self.account_state.unrealized_pnl = total_unrealized_pnl
+
+            # Calculate total exposure across all positions
+            total_exposure = 0.0
+            for pos in all_positions.values():
+                if pos.current_side != Side.FLAT and pos.entry_price:
+                    total_exposure += abs(pos.position_size * pos.entry_price)
+
+            # Update balance and equity
             total_balance = sum(balance.values())
             self.account_state.balance = total_balance
-            self.account_state.equity = total_balance + self.account_state.unrealized_pnl
-            
+            self.account_state.equity = total_balance + total_unrealized_pnl
+
+            # Update exposure and leverage
+            if self.account_state.equity > 0:
+                self.account_state.exposure_pct = total_exposure / self.account_state.equity
+                self.account_state.leverage = total_exposure / self.account_state.equity
+            else:
+                self.account_state.exposure_pct = 0.0
+                self.account_state.leverage = 0.0
+
+            # Reset day-start equity at day boundary
+            today = datetime.now().date()
+            if self._current_day is None or self._current_day != today:
+                self._current_day = today
+                self._day_start_equity = self.account_state.equity
+                logger.info(f"New trading day — start equity: {self._day_start_equity:.2f}")
+
+            # Update peak equity (high-water mark)
+            if self.account_state.equity > self._peak_equity:
+                self._peak_equity = self.account_state.equity
+
+            # Calculate current drawdown from peak
+            if self._peak_equity > 0:
+                self.account_state.current_drawdown = (
+                    (self._peak_equity - self.account_state.equity) / self._peak_equity
+                )
+            else:
+                self.account_state.current_drawdown = 0.0
+
+            # Track max drawdown
+            if self.account_state.current_drawdown > self.account_state.max_drawdown:
+                self.account_state.max_drawdown = self.account_state.current_drawdown
+
+            # Calculate daily loss (including unrealized PnL)
+            if self._day_start_equity > 0:
+                daily_change = self.account_state.equity - self._day_start_equity
+                self.account_state.daily_pnl = daily_change
+                self.account_state.daily_loss_pct = max(0.0, -daily_change / self._day_start_equity)
+            else:
+                self.account_state.daily_pnl = 0.0
+                self.account_state.daily_loss_pct = 0.0
+
+            # Emergency: if drawdown exceeds lock threshold, close all positions
+            lock_threshold = self.risk_validator.config.get("drawdown_lock_threshold", 0.20)
+            if self.account_state.current_drawdown >= lock_threshold:
+                logger.critical(
+                    f"EMERGENCY: Drawdown {self.account_state.current_drawdown:.2%} "
+                    f"exceeds lock threshold {lock_threshold:.2%} — closing all positions"
+                )
+                await self._emergency_close_all()
+
         except Exception as e:
             logger.error(f"Error updating account state: {e}")
+
+    async def _emergency_close_all(self):
+        """Emergency close all open positions when drawdown lock triggers."""
+        try:
+            all_positions = self.position_monitor.get_all_positions()
+            for symbol, position in all_positions.items():
+                if position.current_side != Side.FLAT:
+                    logger.critical(f"Emergency closing position: {symbol}")
+                    # Build a dummy market state just for the close
+                    close_action = TradingAction(
+                        action=Action.SELL if position.current_side == Side.LONG else Action.BUY,
+                        size=abs(position.position_size),
+                        expected_return=0,
+                        expected_risk=0,
+                        confidence=1.0,
+                    )
+                    try:
+                        await self.execution_engine.execute_action(
+                            close_action, symbol, position.entry_price or 0
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to emergency close {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"Error in emergency close all: {e}")
     
     async def _update_daily_performance(self):
         """Update daily performance metrics."""
