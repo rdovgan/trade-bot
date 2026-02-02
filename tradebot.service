@@ -1,37 +1,26 @@
 [Unit]
-Description=Trading Bot Service
+Description=Trading Bot
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
-User=rdovgan
-Group=rdovgan
-WorkingDirectory=/home/rdovgan/trade-bot
-Environment="PATH=/home/rdovgan/trade-bot/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+User=root
+WorkingDirectory=/root/trade-bot
+Environment="PATH=/root/trade-bot/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 
-# Pre-start: Update code from git
-ExecStartPre=/bin/bash -c 'cd /home/rdovgan/trade-bot && git pull origin master'
+# Git pull before starting
+ExecStartPre=/bin/bash -c 'cd /root/trade-bot && git pull origin master'
 
-# Start the bot
-ExecStart=/home/rdovgan/trade-bot/.venv/bin/python -m trade_bot.main
+# Run the bot
+ExecStart=/root/trade-bot/.venv/bin/python -m trade_bot.main
 
-# Restart behavior
+# Auto-restart on failure
 Restart=on-failure
 RestartSec=60
-StartLimitBurst=5
-StartLimitIntervalSec=300
 
 # Logging
-StandardOutput=append:/home/rdovgan/trade-bot/logs/bot.log
-StandardError=append:/home/rdovgan/trade-bot/logs/bot_error.log
-
-# Security hardening (optional)
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/rdovgan/trade-bot/logs /home/rdovgan/trade-bot/data
+StandardOutput=append:/root/trade-bot/logs/bot.log
+StandardError=append:/root/trade-bot/logs/bot.log
 
 [Install]
 WantedBy=multi-user.target
