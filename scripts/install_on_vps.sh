@@ -39,7 +39,9 @@ echo "Step 2/6: Cloning repository..."
 if [ -d "$BOT_DIR" ]; then
     echo "Directory $BOT_DIR already exists. Updating..."
     cd "$BOT_DIR"
-    git pull
+    # Ensure we're on master branch
+    git checkout master 2>/dev/null || git checkout -b master
+    git pull origin master
 else
     git clone "$GIT_REPO" "$BOT_DIR"
     cd "$BOT_DIR"
@@ -51,7 +53,7 @@ echo "Step 3/6: Setting up Python environment..."
 if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi
-source .venv/bin/activate
+. .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
