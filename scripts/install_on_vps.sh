@@ -11,7 +11,7 @@ echo ""
 # Configuration
 BOT_USER=$(whoami)
 BOT_DIR="$HOME/trade-bot"
-GIT_REPO="https://github.com/yourusername/trade-bot.git"  # CHANGE THIS
+GIT_REPO="https://github.com/rdovgan/trade-bot.git"
 SERVICE_TYPE="continuous"  # Options: continuous, oneshot
 
 echo "Configuration:"
@@ -21,9 +21,9 @@ echo "  Git Repo: $GIT_REPO"
 echo "  Service Type: $SERVICE_TYPE"
 echo ""
 
-read -p "Continue with installation? (y/n) " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+read -p "Continue with installation? (y/n) " REPLY
+if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
+    echo "Installation cancelled."
     exit 1
 fi
 
