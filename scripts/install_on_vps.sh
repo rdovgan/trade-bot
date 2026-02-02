@@ -55,7 +55,15 @@ if [ ! -d ".venv" ]; then
 fi
 . .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+
+# Install dependencies from pyproject.toml
+if [ -f "pyproject.toml" ]; then
+    pip install -e .
+elif [ -f "requirements.txt" ]; then
+    pip install -r requirements.txt
+else
+    echo "Warning: No pyproject.toml or requirements.txt found"
+fi
 
 # Step 4: Create logs directory
 echo ""
