@@ -1,0 +1,31 @@
+[Unit]
+Description=Trading Bot (One-shot execution)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rdovgan
+Group=rdovgan
+WorkingDirectory=/home/rdovgan/trade-bot
+Environment="PATH=/home/rdovgan/trade-bot/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Pre-start: Update code from git
+ExecStartPre=/bin/bash -c 'cd /home/rdovgan/trade-bot && git pull origin master'
+
+# Run the bot (will run until completion or manual stop)
+ExecStart=/home/rdovgan/trade-bot/.venv/bin/python -m trade_bot.main
+
+# Logging
+StandardOutput=append:/home/rdovgan/trade-bot/logs/bot.log
+StandardError=append:/home/rdovgan/trade-bot/logs/bot_error.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/rdovgan/trade-bot/logs /home/rdovgan/trade-bot/data
+
+[Install]
+WantedBy=multi-user.target
