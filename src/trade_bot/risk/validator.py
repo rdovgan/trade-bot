@@ -42,18 +42,18 @@ class RiskValidator:
             "max_risk_per_trade_absolute": 0.02,  # 2% absolute maximum
             
             # Exposure limits
-            "max_exposure_per_asset": 0.20,  # 20% per asset (reduced from 30%)
-            "max_total_exposure": 0.40,  # 40% total exposure (reduced from 50%)
-            "max_leverage": 1.0,  # NO LEVERAGE - spot trading only (reduced from 2.0)
+            "max_exposure_per_asset": 0.30,  # 30% per asset (as per plan.md)
+            "max_total_exposure": 0.50,  # 50% total exposure (as per plan.md)
+            "max_leverage": 2.0,  # Maximum 2x leverage (as per plan.md)
             
             # Daily risk limits
-            "max_daily_loss": 0.03,  # 3% daily loss limit (reduced from 5%)
-            "max_consecutive_losses": 3,  # 3 consecutive trades (reduced from 5)
-
-            # Drawdown controls (MUCH MORE AGGRESSIVE)
-            "drawdown_reduction_threshold": 0.05,  # 5% DD -> 50% size reduction (reduced from 10%)
-            "drawdown_pause_threshold": 0.08,  # 8% DD -> trading pause (reduced from 15%)
-            "drawdown_lock_threshold": 0.10,  # 10% DD -> system lock (CRITICAL: reduced from 20%)
+            "max_daily_loss": 0.05,  # 5% daily loss limit (as per plan.md)
+            "max_consecutive_losses": 5,  # 5 consecutive trades (as per plan.md)
+            
+            # Drawdown controls
+            "drawdown_reduction_threshold": 0.10,  # 10% DD -> 50% size reduction (as per plan.md)
+            "drawdown_pause_threshold": 0.15,  # 15% DD -> trading pause (as per plan.md)
+            "drawdown_lock_threshold": 0.20,  # 20% DD -> system lock (as per plan.md)
             
             # Volatility guards
             "volatility_guard_threshold": 95,  # 95th percentile
@@ -355,9 +355,27 @@ class RiskValidator:
         max_notional = account_state.equity * self.config["max_exposure_per_asset"]
         if notional_value > max_notional:
             base_size = max_notional / market_state.current_price
-        
-        # Adjust for confidence
-        adjusted_size = base_size * confidence
+
+        # Adjust for confidence - NON-LINEAR scaling
+        # Low confidence (< 0.5) = very small position (min 10%)
+        # Medium confidence (0.5-0.7) = modest position (50-100%)
+        # High confidence (0.7-0.9) = full position (100-150%)
+        # Very high confidence (> 0.9) = up to 200% of base size
+        if confidence < 0.5:
+            confidence_multiplier = 0.1 + (confidence * 0.8)  # 0.1 to 0.5
+        elif confidence < 0.7:
+            confidence_multiplier = 0.5 + ((confidence - 0.5) * 2.5)  # 0.5 to 1.0
+        elif confidence < 0.9:
+            confidence_multiplier = 1.0 + ((confidence - 0.7) * 2.5)  # 1.0 to 1.5
+        else:
+            confidence_multiplier = 1.5 + ((confidence - 0.9) * 5.0)  # 1.5 to 2.0
+
+        adjusted_size = base_size * confidence_multiplier
+
+        logger.info(
+            f"Confidence-based sizing: confidence={confidence:.2f} -> "
+            f"multiplier={confidence_multiplier:.2f}x -> size={adjusted_size:.6f}"
+        )
         
         # Adjust for drawdown (if applicable)
         if account_state.current_drawdown >= self.config["drawdown_reduction_threshold"]:

@@ -433,8 +433,8 @@ class TradingBot:
                                     worst_pnl_pct = pnl_pct
                                     worst_symbol = pos_symbol
 
-                        # Close worst position if losing > 0.5% (more aggressive)
-                        if worst_symbol and worst_pnl_pct < -0.5:
+                        # Close worst position if losing > 1%
+                        if worst_symbol and worst_pnl_pct < -1.0:
                             logger.warning(
                                 f"Max positions ({max_positions}) reached. Closing worst position "
                                 f"{worst_symbol} (PnL: {worst_pnl_pct:.2f}%) to make room for {symbol}"
