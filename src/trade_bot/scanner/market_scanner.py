@@ -43,12 +43,13 @@ class MarketScanner:
     # Public API
     # ------------------------------------------------------------------
 
-    async def scan_market(self, exchange) -> List[CoinCandidate]:
+    async def scan_market(self, exchange, open_positions: Optional[Dict] = None) -> List[CoinCandidate]:
         """
         Full market scan.
 
         *exchange* is expected to expose CCXT-compatible async methods:
         ``load_markets()``, ``fetch_tickers()``.
+        *open_positions* is a dict of symbol -> PositionState for penalty calculation.
         """
         # load_markets with reload=False reuses cached data if available
         markets = await exchange.load_markets(reload=False)
@@ -70,6 +71,18 @@ class MarketScanner:
 
         # Normalise & score
         candidates = self._normalise_and_score(candidates)
+
+        # PENALTY: Reduce score by 50% for symbols with open positions
+        if open_positions:
+            for candidate in candidates:
+                if candidate.symbol in open_positions:
+                    position = open_positions[candidate.symbol]
+                    # Only penalize if position is not FLAT
+                    from ..core.enums import Side
+                    if position.current_side != Side.FLAT:
+                        old_score = candidate.score
+                        candidate.score *= 0.5  # 50% penalty
+                        logger.info(f"Applied position penalty to {candidate.symbol}: score {old_score:.3f} -> {candidate.score:.3f}")
 
         # Sort descending by score
         candidates.sort(key=lambda c: c.score, reverse=True)

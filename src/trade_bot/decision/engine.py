@@ -440,6 +440,32 @@ class DecisionEngine:
                     logger.info("Trailing stop triggered for short position")
                     return True
 
+        # AGGRESSIVE CLOSE: Cut losses early at -1.5% (before stop loss)
+        if position_state.entry_price and position_state.position_size != 0:
+            pnl_pct = 0.0
+            if position_state.current_side == Side.LONG:
+                pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
+            else:
+                pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
+
+            # Close if loss > 1.5%
+            if pnl_pct < -1.5:
+                logger.warning(f"Aggressive loss cut triggered: {pnl_pct:.2f}% loss")
+                return True
+
+            # Close if profit > 2.5% (take quick profits)
+            if pnl_pct > 2.5:
+                logger.info(f"Aggressive profit take triggered: {pnl_pct:.2f}% profit")
+                return True
+
+        # AGGRESSIVE CLOSE: Close positions older than 4 hours
+        if position_state.entry_time:
+            from datetime import datetime, timedelta
+            age = datetime.now() - position_state.entry_time
+            if age > timedelta(hours=4):
+                logger.info(f"Position age limit triggered: {age.total_seconds()/3600:.1f} hours old")
+                return True
+
         # Check risk limits — safe mode forces closure of low-confidence positions
         if risk_state.safe_mode_active:
             logger.info("Safe mode active - considering position closure")

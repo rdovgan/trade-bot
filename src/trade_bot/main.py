@@ -279,7 +279,11 @@ class TradingBot:
 
         try:
             exchange = self.data_connector.exchange
-            candidates = await self.scanner.scan_market(exchange)
+
+            # Pass open positions to scanner for penalty calculation
+            open_positions = self.position_monitor.get_all_positions()
+            candidates = await self.scanner.scan_market(exchange, open_positions=open_positions)
+
             max_pos = scanner_cfg.get('max_positions', 5)
             top = self.scanner.get_top_candidates(max_pos)
 
@@ -400,8 +404,51 @@ class TradingBot:
                     active_positions=active_count,
                 )
 
-                # Execute action if not HOLD
+                # CLOSE/REPLACE LOGIC: If max positions reached and new signal, close worst position
                 if action and action.action.value != 'HOLD':
+                    scanner_cfg = self.config.get('scanner', {})
+                    max_positions = scanner_cfg.get('max_positions', 3)
+
+                    if active_count >= max_positions:
+                        # Find worst performing position (most negative unrealized PnL)
+                        worst_symbol = None
+                        worst_pnl_pct = 0.0
+
+                        for pos_symbol, pos in all_positions.items():
+                            if pos.current_side == Side.FLAT:
+                                continue
+                            if not pos.entry_price or pos.entry_price == 0:
+                                continue
+
+                            # Calculate unrealized PnL %
+                            current_price = await self._get_current_price(pos_symbol)
+                            if current_price:
+                                if pos.current_side == Side.LONG:
+                                    pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+                                else:
+                                    pnl_pct = ((pos.entry_price - current_price) / pos.entry_price) * 100
+
+                                # Track worst (most negative)
+                                if pnl_pct < worst_pnl_pct:
+                                    worst_pnl_pct = pnl_pct
+                                    worst_symbol = pos_symbol
+
+                        # Close worst position if losing > 1%
+                        if worst_symbol and worst_pnl_pct < -1.0:
+                            logger.warning(
+                                f"Max positions ({max_positions}) reached. Closing worst position "
+                                f"{worst_symbol} (PnL: {worst_pnl_pct:.2f}%) to make room for {symbol}"
+                            )
+                            worst_market_state = await self.data_manager.get_market_state(worst_symbol, timeframe)
+                            await self._close_position(worst_symbol, worst_market_state)
+                        else:
+                            logger.warning(
+                                f"Max positions ({max_positions}) reached but no losing position to close. "
+                                f"Skipping new signal for {symbol}"
+                            )
+                            return
+
+                    # Execute action
                     await self._execute_action(action, symbol, market_state)
             
         except Exception as e:
@@ -424,13 +471,22 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error executing action for {symbol}: {e}")
     
+    async def _get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current price for a symbol."""
+        try:
+            ticker = await self.data_connector.exchange.fetch_ticker(symbol)
+            return ticker.get('last')
+        except Exception as e:
+            logger.error(f"Error fetching current price for {symbol}: {e}")
+            return None
+
     async def _close_position(self, symbol: str, market_state: MarketState):
         """Close existing position."""
         try:
             position = self.position_monitor.get_position(symbol)
             if not position or position.current_side == Side.FLAT:
                 return
-            
+
             # Create closing action
             close_action = TradingAction(
                 action=Action.SELL if position.current_side == Side.LONG else Action.BUY,
