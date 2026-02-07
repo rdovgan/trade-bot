@@ -440,38 +440,46 @@ class DecisionEngine:
                     logger.info("Trailing stop triggered for short position")
                     return True
 
-        # AGGRESSIVE CLOSE: Time-based rules
+        # AGGRESSIVE CLOSE: MUCH FASTER reaction to losses
         if position_state.entry_time:
             from datetime import datetime, timedelta
             age = datetime.now() - position_state.entry_time
+            age_minutes = age.total_seconds() / 60
             age_hours = age.total_seconds() / 3600
 
-            # Force close after 8 hours regardless of PnL
-            if age > timedelta(hours=8):
-                logger.info(f"Position age limit triggered: {age_hours:.1f} hours old (max 8h)")
+            # Calculate current PnL if possible
+            pnl_pct = 0.0
+            if position_state.entry_price and position_state.position_size != 0:
+                if position_state.current_side == Side.LONG:
+                    pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
+                else:
+                    pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
+
+            # IMMEDIATE: Close if any position hits -2% loss regardless of age
+            if pnl_pct < -2.0:
+                logger.critical(f"EMERGENCY LOSS CUT: {pnl_pct:.2f}% loss - closing immediately!")
                 return True
 
-            # Aggressive rules apply only for positions older than 4 hours
+            # Force close after 4 hours regardless of PnL (reduced from 8h)
             if age > timedelta(hours=4):
-                if position_state.entry_price and position_state.position_size != 0:
-                    pnl_pct = 0.0
-                    if position_state.current_side == Side.LONG:
-                        pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
-                    else:
-                        pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
+                logger.info(f"Position age limit triggered: {age_hours:.1f} hours old (max 4h)")
+                return True
 
-                    # Close if loss > 1.5%
-                    if pnl_pct < -1.5:
-                        logger.warning(f"Aggressive loss cut triggered for old position ({age_hours:.1f}h): {pnl_pct:.2f}% loss")
-                        return True
+            # Quick aggressive rules after just 30 minutes (reduced from 4h!)
+            if age > timedelta(minutes=30):
+                # Close if loss > 0.8% (much more aggressive than 1.5%)
+                if pnl_pct < -0.8:
+                    logger.warning(f"Quick loss cut triggered ({age_minutes:.0f}min old): {pnl_pct:.2f}% loss")
+                    return True
 
-                    # Close if profit > 2.5%
-                    if pnl_pct > 2.5:
-                        logger.info(f"Aggressive profit take triggered for old position ({age_hours:.1f}h): {pnl_pct:.2f}% profit")
-                        return True
+                # Close if profit > 1.5% (take profits faster)
+                if pnl_pct > 1.5:
+                    logger.info(f"Quick profit take triggered ({age_minutes:.0f}min old): {pnl_pct:.2f}% profit")
+                    return True
 
-        # Check risk limits — safe mode forces closure of low-confidence positions
+        # CRITICAL: Safe mode forces closure of ALL positions
         if risk_state.safe_mode_active:
-            logger.info("Safe mode active - considering position closure")
+            logger.critical("SAFE MODE ACTIVE - Force closing position for risk protection")
+            return True
 
         return False

@@ -42,18 +42,18 @@ class RiskValidator:
             "max_risk_per_trade_absolute": 0.02,  # 2% absolute maximum
             
             # Exposure limits
-            "max_exposure_per_asset": 0.30,  # 30% per asset (as per plan.md)
-            "max_total_exposure": 0.50,  # 50% total exposure (as per plan.md)
-            "max_leverage": 2.0,  # Maximum 2x leverage (as per plan.md)
+            "max_exposure_per_asset": 0.20,  # 20% per asset (reduced from 30%)
+            "max_total_exposure": 0.40,  # 40% total exposure (reduced from 50%)
+            "max_leverage": 1.0,  # NO LEVERAGE - spot trading only (reduced from 2.0)
             
             # Daily risk limits
-            "max_daily_loss": 0.05,  # 5% daily loss limit (as per plan.md)
-            "max_consecutive_losses": 5,  # 5 consecutive trades (as per plan.md)
-            
-            # Drawdown controls
-            "drawdown_reduction_threshold": 0.10,  # 10% DD -> 50% size reduction (as per plan.md)
-            "drawdown_pause_threshold": 0.15,  # 15% DD -> trading pause (as per plan.md)
-            "drawdown_lock_threshold": 0.20,  # 20% DD -> system lock (as per plan.md)
+            "max_daily_loss": 0.03,  # 3% daily loss limit (reduced from 5%)
+            "max_consecutive_losses": 3,  # 3 consecutive trades (reduced from 5)
+
+            # Drawdown controls (MUCH MORE AGGRESSIVE)
+            "drawdown_reduction_threshold": 0.05,  # 5% DD -> 50% size reduction (reduced from 10%)
+            "drawdown_pause_threshold": 0.08,  # 8% DD -> trading pause (reduced from 15%)
+            "drawdown_lock_threshold": 0.10,  # 10% DD -> system lock (CRITICAL: reduced from 20%)
             
             # Volatility guards
             "volatility_guard_threshold": 95,  # 95th percentile
