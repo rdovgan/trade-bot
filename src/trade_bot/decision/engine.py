@@ -440,14 +440,19 @@ class DecisionEngine:
                     logger.info("Trailing stop triggered for short position")
                     return True
 
-        # AGGRESSIVE CLOSE: Only for positions older than 4 hours
+        # AGGRESSIVE CLOSE: Time-based rules
         if position_state.entry_time:
             from datetime import datetime, timedelta
             age = datetime.now() - position_state.entry_time
+            age_hours = age.total_seconds() / 3600
 
-            # Only apply aggressive rules if position is older than 4 hours
+            # Force close after 8 hours regardless of PnL
+            if age > timedelta(hours=8):
+                logger.info(f"Position age limit triggered: {age_hours:.1f} hours old (max 8h)")
+                return True
+
+            # Aggressive rules apply only for positions older than 4 hours
             if age > timedelta(hours=4):
-                # For old positions: aggressive loss cutting and profit taking
                 if position_state.entry_price and position_state.position_size != 0:
                     pnl_pct = 0.0
                     if position_state.current_side == Side.LONG:
@@ -457,17 +462,13 @@ class DecisionEngine:
 
                     # Close if loss > 1.5%
                     if pnl_pct < -1.5:
-                        logger.warning(f"Aggressive loss cut triggered for old position ({age.total_seconds()/3600:.1f}h): {pnl_pct:.2f}% loss")
+                        logger.warning(f"Aggressive loss cut triggered for old position ({age_hours:.1f}h): {pnl_pct:.2f}% loss")
                         return True
 
-                    # Close if profit > 2.5% (take quick profits)
+                    # Close if profit > 2.5%
                     if pnl_pct > 2.5:
-                        logger.info(f"Aggressive profit take triggered for old position ({age.total_seconds()/3600:.1f}h): {pnl_pct:.2f}% profit")
+                        logger.info(f"Aggressive profit take triggered for old position ({age_hours:.1f}h): {pnl_pct:.2f}% profit")
                         return True
-
-                # If still here after 4 hours, close anyway to force rotation
-                logger.info(f"Position age limit triggered: {age.total_seconds()/3600:.1f} hours old")
-                return True
 
         # Check risk limits — safe mode forces closure of low-confidence positions
         if risk_state.safe_mode_active:
