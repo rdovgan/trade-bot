@@ -240,6 +240,29 @@ class DecisionEngine:
         This follows the architecture: SCAN -> SIGNAL -> RESEARCH -> DECIDE -> RISK VALIDATOR
         """
         try:
+            # CRITICAL: If Safe Mode is active and we have a losing position, CLOSE IT
+            if risk_state.safe_mode_active and position_state.current_side != Side.FLAT:
+                if position_state.entry_price and position_state.entry_price > 0:
+                    # Calculate unrealized PnL
+                    if position_state.current_side == Side.LONG:
+                        pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
+                    else:
+                        pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
+
+                    # If position is losing, force close it to free capital
+                    if pnl_pct < 0:
+                        logger.critical(
+                            f"SAFE MODE FORCE CLOSE: Position has {pnl_pct:.2f}% unrealized loss. "
+                            f"Generating CLOSE action to free capital and exit safe mode."
+                        )
+                        return self._create_close_action(position_state, market_state)
+
+                    # Even if profitable, close to reduce exposure in safe mode
+                    logger.warning(
+                        f"SAFE MODE: Closing position with {pnl_pct:.2f}% profit to reduce exposure."
+                    )
+                    return self._create_close_action(position_state, market_state)
+
             # Step 1: Generate signals
             logger.info("Generating trading signals...")
             signals = self.signal_manager.generate_signals(market_state)
@@ -354,6 +377,31 @@ class DecisionEngine:
             expected_return=0.0,
             expected_risk=0.0,
             confidence=1.0
+        )
+
+    def _create_close_action(self, position_state: PositionState, market_state: MarketState) -> TradingAction:
+        """Create a close action for existing position."""
+        # Determine close direction (opposite of current position)
+        if position_state.current_side == Side.LONG:
+            close_action = Action.SELL
+        else:
+            close_action = Action.BUY
+
+        close_size = abs(position_state.position_size)
+
+        logger.info(
+            f"Creating CLOSE action: {close_action.value} size={close_size:.6f} "
+            f"to close {position_state.current_side.value} position"
+        )
+
+        return TradingAction(
+            action=close_action,
+            size=close_size,
+            expected_return=0.0,
+            expected_risk=0.0,
+            confidence=1.0,  # High confidence for forced close
+            stop_loss=None,
+            take_profit=None,
         )
 
     def _record_decision(
