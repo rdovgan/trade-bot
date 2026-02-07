@@ -93,7 +93,7 @@ class TradingBot:
                 'scan_interval_minutes': 15,
                 'quote_currency': 'USDT',
                 'min_volume_24h': 1_000_000,
-                'max_positions': 3,
+                'max_positions': 5,
                 'portfolio_pct': 0.30,
                 'blacklist': [],
             },
