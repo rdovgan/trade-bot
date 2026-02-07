@@ -67,9 +67,9 @@ class RiskValidator:
             
             # Red days control
             "max_red_days": 3,  # 3 consecutive red days -> safe mode
-            
+
             # Max concurrent positions (scanner)
-            "max_positions": 3,
+            "max_positions": 5,
         }
     
     def validate_trading_action(
