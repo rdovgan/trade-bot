@@ -407,7 +407,7 @@ class TradingBot:
                 # CLOSE/REPLACE LOGIC: If max positions reached and new signal, close worst position
                 if action and action.action.value != 'HOLD':
                     scanner_cfg = self.config.get('scanner', {})
-                    max_positions = scanner_cfg.get('max_positions', 3)
+                    max_positions = scanner_cfg.get('max_positions', 5)
 
                     if active_count >= max_positions:
                         # Find worst performing position (most negative unrealized PnL)
