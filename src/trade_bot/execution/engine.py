@@ -9,6 +9,8 @@ import uuid
 
 import ccxt.async_support as ccxt
 
+import pandas as pd
+
 from ..core.models import (
     MarketState, PositionState, AccountState, Order, Trade,
     TradingAction, OrderType, OrderStatus, Side
@@ -17,6 +19,11 @@ from ..core.enums import Action, Regime
 from ..core.state_lock import state_manager
 
 logger = logging.getLogger(__name__)
+
+
+class PositionFetchError(Exception):
+    """Raised when positions cannot be fetched from exchange."""
+    pass
 
 
 class ExchangeConnector(ABC):
@@ -241,10 +248,16 @@ class CCXTExchangeConnector(ExchangeConnector):
             return {}
     
     async def get_positions(self) -> List[Dict]:
-        """Get open positions."""
+        """Get open positions from exchange with error handling.
+
+        Raises:
+            PositionFetchError: If positions cannot be fetched due to network/exchange errors.
+        """
         try:
             if hasattr(self.exchange, 'fetch_positions'):
                 positions = await self.exchange.fetch_positions()
+                if positions is None:
+                    raise PositionFetchError("Exchange returned None for positions")
                 return [
                     {
                         'symbol': pos.get('symbol') or '',
@@ -257,10 +270,17 @@ class CCXTExchangeConnector(ExchangeConnector):
                     if float(pos.get('contracts') or 0) != 0
                 ]
             else:
+                logger.warning("Exchange does not support fetch_positions")
                 return []
+        except ccxt.NetworkError as e:
+            raise PositionFetchError(f"Network error fetching positions: {e}")
+        except ccxt.ExchangeError as e:
+            raise PositionFetchError(f"Exchange error fetching positions: {e}")
+        except PositionFetchError:
+            raise
         except Exception as e:
             logger.error(f"Error fetching positions: {e}")
-            return []
+            raise PositionFetchError(f"Unexpected error fetching positions: {e}")
     
     async def _clamp_amount(self, symbol: str, amount: float) -> float:
         """Clamp order amount to exchange min/max and precision."""
@@ -328,13 +348,19 @@ class CCXTExchangeConnector(ExchangeConnector):
 
 class PositionMonitor:
     """Monitors open positions and manages risk."""
-    
+
     def __init__(self, exchange_connector: ExchangeConnector):
         """Initialize position monitor."""
         self.exchange = exchange_connector
         self._running = False
         self._positions: Dict[str, PositionState] = {}
+        self._positions_stale = False  # Flag to indicate stale position data
         logger.info("Position monitor initialized")
+
+    @property
+    def positions_stale(self) -> bool:
+        """Check if position data is stale due to fetch errors."""
+        return self._positions_stale
     
     async def start_monitoring(self, symbols: List[str]):
         """Start monitoring positions for given symbols."""
@@ -366,13 +392,20 @@ class PositionMonitor:
                 await asyncio.sleep(5)  # Back off on error
     
     async def _update_positions(self):
-        """Update position information with locking."""
+        """Update position information with locking.
+
+        On success, clears the stale flag. On error, sets stale flag but keeps existing data.
+        """
         async with state_manager.lock_state("positions"):
             try:
                 positions = await self.exchange.get_positions()
 
+                # Track which symbols were seen from exchange
+                seen_symbols = set()
+
                 for pos_data in positions:
                     symbol = pos_data['symbol']
+                    seen_symbols.add(symbol)
 
                     # Update position state
                     if symbol not in self._positions:
@@ -391,8 +424,25 @@ class PositionMonitor:
                     else:
                         position.current_side = Side.FLAT
 
+                # Mark positions not on exchange as flat (position closed externally)
+                for symbol in list(self._positions.keys()):
+                    if symbol not in seen_symbols:
+                        if self._positions[symbol].current_side != Side.FLAT:
+                            logger.info(f"Position {symbol} no longer on exchange, marking as FLAT")
+                            self._positions[symbol].current_side = Side.FLAT
+                            self._positions[symbol].position_size = 0
+
+                # Successfully updated - clear stale flag
+                self._positions_stale = False
+
+            except PositionFetchError as e:
+                logger.error(f"Failed to fetch positions: {e}")
+                # DON'T clear positions on error - keep stale data
+                # Set flag to prevent trading with stale data
+                self._positions_stale = True
             except Exception as e:
                 logger.error(f"Error updating positions: {e}")
+                self._positions_stale = True
     
     async def _check_risk_events(self):
         """Check for risk events that require action."""
@@ -409,12 +459,22 @@ class PositionMonitor:
                 )
     
     def get_position(self, symbol: str) -> Optional[PositionState]:
-        """Get position state for a symbol."""
+        """Get position state for a symbol (sync, no locking - use get_position_safe for concurrent access)."""
         return self._positions.get(symbol)
-    
+
     def get_all_positions(self) -> Dict[str, PositionState]:
-        """Get all positions."""
+        """Get all positions (sync, no locking - use get_all_positions_safe for concurrent access)."""
         return self._positions.copy()
+
+    async def get_position_safe(self, symbol: str) -> Optional[PositionState]:
+        """Get position with locking for concurrent access."""
+        async with state_manager.lock_state("positions"):
+            return self._positions.get(symbol)
+
+    async def get_all_positions_safe(self) -> Dict[str, PositionState]:
+        """Get all positions with locking for concurrent access."""
+        async with state_manager.lock_state("positions"):
+            return dict(self._positions)
 
 
 class ExecutionEngine:
@@ -447,6 +507,21 @@ class ExecutionEngine:
         self._running = False
 
         logger.info("Execution engine initialized")
+
+    async def _add_trade(self, trade: Trade):
+        """Add trade with locking."""
+        async with state_manager.lock_state("trades"):
+            self._trades.append(trade)
+
+    async def get_trades_safe(self) -> List[Trade]:
+        """Get trades with locking."""
+        async with state_manager.lock_state("trades"):
+            return list(self._trades)
+
+    async def get_open_trade(self, symbol: str) -> Optional[Trade]:
+        """Get open trade for symbol with locking."""
+        async with state_manager.lock_state("trades"):
+            return next((t for t in self._trades if t.symbol == symbol and t.status == "open"), None)
 
     async def start_monitoring(self):
         """Start background order monitoring task."""
@@ -656,7 +731,7 @@ class ExecutionEngine:
                 funding_cost=0.0,
             )
 
-            self._trades.append(trade)
+            await self._add_trade(trade)
             logger.info(f"Created trade record: {trade.id}")
             return trade.id
 
@@ -755,9 +830,18 @@ class ExecutionEngine:
             logger.error(f"Trade {trade_id} not found for stop fill")
             return
 
-        # Calculate PnL
+        # Validate exit price
         exit_price = exit_order.average_fill_price or exit_order.price
+        if not exit_price or exit_price <= 0:
+            logger.error(f"Invalid exit price for trade {trade_id}: {exit_price}")
+            raise ValueError(f"Cannot complete trade with invalid exit price: {exit_price}")
+
+        # Validate entry price
         entry_price = trade.entry_price
+        if not entry_price or entry_price <= 0:
+            logger.error(f"Invalid entry price for trade {trade_id}: {entry_price}")
+            raise ValueError(f"Cannot complete trade with invalid entry price: {entry_price}")
+
         quantity = trade.quantity
 
         # Long: (exit - entry) * quantity
@@ -800,50 +884,55 @@ class ExecutionEngine:
             f"R={trade.r_multiple:.2f}x"
         )
 
-    async def _persist_trade_to_journal(self, trade: Trade):
+    async def _persist_trade_to_journal(self, trade: Trade, market_state: Optional[MarketState] = None):
         """Persist completed trade to journal database."""
         if not self.journal:
             logger.warning("No journal configured - trade not persisted")
             return
 
         try:
-            self.journal.record_trade(
-                trade_id=trade.id,
-                symbol=trade.symbol,
-                side=trade.side.value,
-                quantity=trade.quantity,
-                entry_price=trade.entry_price,
-                exit_price=trade.exit_price,
-                entry_time=trade.entry_time,
-                exit_time=trade.exit_time,
-                pnl=trade.pnl,
-                pnl_pct=trade.pnl_pct,
-                r_multiple=trade.r_multiple,
-                mae=trade.mae,
-                mfe=trade.mfe,
-                stop_loss=trade.stop_loss,
-                take_profit=trade.take_profit,
-                regime=trade.regime.value,
-                volatility_percentile=trade.volatility_percentile,
-                liquidity_score=trade.liquidity_score,
-                slippage=trade.slippage,
-                confidence=trade.confidence,
-            )
+            # Create minimal market state if not provided
+            if market_state is None:
+                market_state = MarketState(
+                    ohlcv=pd.DataFrame(),  # Empty DataFrame for completed trades
+                    current_price=trade.exit_price or trade.entry_price,
+                    atr=0.0,
+                    realized_volatility=0.0,
+                    spread=0.0,
+                    order_book_imbalance=0.0,
+                    volume_delta=0.0,
+                    liquidity_score=trade.liquidity_score,
+                    regime_label=trade.regime,
+                    volatility_percentile=trade.volatility_percentile,
+                )
+
+            self.journal.record_trade(trade, market_state)
             logger.info(f"Persisted trade {trade.id} to journal")
         except Exception as e:
             logger.error(f"Failed to persist trade {trade.id}: {e}")
 
     async def complete_trade_on_manual_close(self, symbol: str, exit_order: Order):
-        """Complete trade after manual close."""
+        """Complete trade after manual close - validates order is filled."""
+        # Validate order status
+        if exit_order.status != OrderStatus.FILLED:
+            raise ValueError(f"Cannot complete trade with unfilled order: {exit_order.status}")
+
+        # Validate exit price exists
+        exit_price = exit_order.average_fill_price or exit_order.price
+        if not exit_price or exit_price <= 0:
+            raise ValueError(f"Exit order has no valid fill price: {exit_price}")
+
         # Find open trade for this symbol
-        open_trade = next((t for t in self._trades if t.symbol == symbol and t.status == "open"), None)
+        open_trade = await self.get_open_trade(symbol)
         if not open_trade:
             logger.warning(f"No open trade found for {symbol}")
             return
 
-        # Complete the trade (similar logic to stop loss completion)
-        exit_price = exit_order.average_fill_price or exit_order.price
+        # Validate entry price
         entry_price = open_trade.entry_price
+        if not entry_price or entry_price <= 0:
+            raise ValueError(f"Cannot complete trade with invalid entry price: {entry_price}")
+
         quantity = open_trade.quantity
 
         # Calculate PnL

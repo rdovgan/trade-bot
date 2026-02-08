@@ -297,8 +297,25 @@ class DecisionEngine:
 
             if not is_valid:
                 logger.warning(f"Trading action rejected by risk validator: {rejection_reason}")
+                
+                # --- NEW: Check for replacement opportunity on Max Positions Reached ---
+                if "Max positions reached" in rejection_reason and best_signal.confidence > 0.7:
+                    # Find the worst losing position among all active positions (assuming scanner/main loop provides this)
+                    # NOTE: This requires the calling function to provide the full list of positions and their PnL.
+                    # For now, we only have 'position_state' (for the current symbol) and 'active_positions' count.
+                    
+                    # Assume worst_position logic lives in the caller (Main Loop) and a flag is passed.
+                    # As a temporary fix, we will simply log this state, but real replacement needs context of ALL positions.
+                    
+                    # For proper replacement logic, we need to know the worst position's symbol/size/pnl.
+                    # We should fail the new trade, log the rejected trade, and rely on the aggressive close to clear the worst one.
+                    # For now, rely on aggressive close (should_close_position) or manual intervention.
+                    pass # Keep the hold action.
+                
                 self._record_decision(adjusted_signal, False, rejection_reason)
                 return self._create_hold_action()
+
+            # --- END NEW CHECK ---
 
             # Step 6: Calculate proper position size
             if adjusted_signal.action in [Action.BUY, Action.SELL]:
