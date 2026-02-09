@@ -164,8 +164,27 @@ class LLMAdvisor:
             'opportunity_score': max(0.0, min(1.0, float(raw.get('opportunity_score', 0.5)))),
             'confidence_adjustment': max(-0.3, min(0.3, float(raw.get('confidence_adjustment', 0.0)))),
             'reasoning': str(raw.get('reasoning', '')),
+            # Include LLM-suggested targets (validated)
+            'stop_loss_target': self._validate_price_target(raw.get('stop_loss_target'), market_state),
+            'take_profit_target': self._validate_price_target(raw.get('take_profit_target'), market_state),
         }
         return result
+
+    def _validate_price_target(self, value: Any, market_state: MarketState) -> Optional[float]:
+        """Validate LLM price target is reasonable."""
+        if value is None:
+            return None
+        try:
+            price = float(value)
+            # Sanity check: within 50% of current price
+            if price <= 0:
+                return None
+            if abs(price - market_state.current_price) / market_state.current_price > 0.5:
+                logger.warning(f"LLM target {price} too far from current {market_state.current_price}")
+                return None
+            return price
+        except (ValueError, TypeError):
+            return None
 
     def _fallback_insights(self, market_state: MarketState) -> Dict[str, Any]:
         """Generate fallback insights without LLM."""
@@ -419,6 +438,7 @@ class DecisionEngine:
             confidence=1.0,  # High confidence for forced close
             stop_loss=None,
             take_profit=None,
+            is_close=True,  # Explicitly mark as close action
         )
 
     def _record_decision(

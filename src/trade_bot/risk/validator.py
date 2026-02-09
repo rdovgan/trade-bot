@@ -5,9 +5,10 @@ from typing import Optional, Tuple, Dict, Any, List
 import logging
 
 from ..core.models import (
-    MarketState, PositionState, AccountState, RiskState, 
+    MarketState, PositionState, AccountState, RiskState,
     TradingAction, RiskLevel
 )
+from typing import TYPE_CHECKING
 from ..core.enums import Action, Side
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,15 @@ class RiskValidator:
             Tuple of (is_valid, rejection_reason)
         """
         try:
-            # Check max concurrent positions
+            # Check if this is a close action (closing existing position)
+            is_close_action = self._is_close_action(action, position_state)
+
+            # Skip position-opening rules for close actions
+            if is_close_action:
+                logger.info(f"Close action validated: {action.action} size={action.size}")
+                return True, None
+
+            # Check max concurrent positions (only for new positions)
             if action.action in [Action.BUY, Action.SELL]:
                 max_pos = self.config.get("max_positions", 5)
                 if active_positions >= max_pos:
@@ -103,11 +112,11 @@ class RiskValidator:
             if risk_state.safe_mode_active:
                 if action.confidence < 0.8:
                     return False, "Safe mode active - only high-confidence trades allowed"
-            
+
             # Validate action-specific rules
             if action.action in [Action.BUY, Action.SELL]:
                 self._validate_new_position(action, market_state, position_state, account_state, risk_state)
-            
+
             # Validate stop loss (must come before position sizing)
             self._validate_stop_loss(action)
 
@@ -116,28 +125,46 @@ class RiskValidator:
 
             # Validate risk:reward ratio
             self._validate_risk_reward_ratio(action)
-            
+
             # Check exposure limits
             self._validate_exposure_limits(action, position_state, account_state, market_state, total_exposure_pct)
-            
+
             # Check market conditions
             self._validate_market_conditions(action, market_state)
-            
+
             # Check daily risk limits
             self._validate_daily_limits(action, account_state, risk_state)
-            
+
             # Check drawdown controls
             self._validate_drawdown_controls(action, account_state, risk_state)
-            
+
             logger.info(f"Trading action validated: {action.action} size={action.size}")
             return True, None
-            
+
         except RiskViolation as e:
             logger.warning(f"Risk validation failed: {e}")
             return False, str(e)
         except Exception as e:
             logger.error(f"Unexpected error in risk validation: {e}")
             return False, f"Validation error: {e}"
+
+    def _is_close_action(self, action: TradingAction, position_state: PositionState) -> bool:
+        """Check if action is closing existing position (not opening new one)."""
+        # Check explicit is_close flag first
+        if getattr(action, 'is_close', False):
+            return True
+
+        # No position to close
+        if position_state.current_side == Side.FLAT:
+            return False
+
+        # Closing long = SELL, closing short = BUY
+        if position_state.current_side == Side.LONG and action.action == Action.SELL:
+            return True
+        if position_state.current_side == Side.SHORT and action.action == Action.BUY:
+            return True
+
+        return False
     
     def _validate_new_position(
         self,

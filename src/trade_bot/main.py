@@ -357,8 +357,8 @@ class TradingBot:
                 logger.warning(f"Skipping {symbol}: {e}")
                 return  # Skip this symbol if data is invalid
             
-            # Get position state
-            position_state = self.position_monitor.get_position(symbol) or PositionState()
+            # Get position state (thread-safe)
+            position_state = await self.position_monitor.get_position_safe(symbol) or PositionState()
             
             # Update account state (simplified)
             await self._update_account_state()
@@ -483,7 +483,7 @@ class TradingBot:
     async def _close_position(self, symbol: str, market_state: MarketState):
         """Close existing position."""
         try:
-            position = self.position_monitor.get_position(symbol)
+            position = await self.position_monitor.get_position_safe(symbol)
             if not position or position.current_side == Side.FLAT:
                 return
 
@@ -493,7 +493,8 @@ class TradingBot:
                 size=abs(position.position_size),
                 expected_return=0,
                 expected_risk=0,
-                confidence=1.0
+                confidence=1.0,
+                is_close=True,  # Explicitly mark as close action
             )
             
             # Execute close
@@ -643,6 +644,7 @@ class TradingBot:
                         expected_return=0,
                         expected_risk=0,
                         confidence=1.0,
+                        is_close=True,  # Explicitly mark as close action
                     )
                     await self.execution_engine.execute_action(
                         close_action, symbol, position.entry_price or 0
