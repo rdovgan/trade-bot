@@ -208,7 +208,7 @@ class TestMarketStateValidation:
             'volume': [1000.0] * 100,
         }, index=dates)
 
-        with pytest.raises(ValueError, match="Invalid OHLCV data"):
+        with pytest.raises(ValueError, match="contains NaN"):
             await processor.create_market_state("BTC/USDT", mock_connector, "1m")
 
     @pytest.mark.asyncio
@@ -224,7 +224,7 @@ class TestMarketStateValidation:
             'volume': [1000.0] * 100,
         }, index=dates)
 
-        with pytest.raises(ValueError, match="Stale market data"):
+        with pytest.raises(ValueError, match="is stale"):
             await processor.create_market_state("BTC/USDT", mock_connector, "1m")
 
 

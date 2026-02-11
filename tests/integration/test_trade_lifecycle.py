@@ -87,8 +87,18 @@ class MockJournal:
     def __init__(self):
         self.trades = []
 
-    def record_trade(self, **kwargs):
-        self.trades.append(kwargs)
+    def record_trade(self, trade, market_state):
+        """Record trade with new API signature (Trade, MarketState objects)."""
+        self.trades.append({
+            'trade': trade,
+            'market_state': market_state,
+            # Also store flat values for easy test assertions
+            'symbol': trade.symbol,
+            'side': trade.side.value,
+            'entry_price': trade.entry_price,
+            'exit_price': trade.exit_price,
+            'pnl': trade.pnl,
+        })
 
 
 @pytest.fixture

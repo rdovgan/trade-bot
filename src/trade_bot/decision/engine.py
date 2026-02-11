@@ -164,8 +164,27 @@ class LLMAdvisor:
             'opportunity_score': max(0.0, min(1.0, float(raw.get('opportunity_score', 0.5)))),
             'confidence_adjustment': max(-0.3, min(0.3, float(raw.get('confidence_adjustment', 0.0)))),
             'reasoning': str(raw.get('reasoning', '')),
+            # Include LLM-suggested targets (validated)
+            'stop_loss_target': self._validate_price_target(raw.get('stop_loss_target'), market_state),
+            'take_profit_target': self._validate_price_target(raw.get('take_profit_target'), market_state),
         }
         return result
+
+    def _validate_price_target(self, value: Any, market_state: MarketState) -> Optional[float]:
+        """Validate LLM price target is reasonable."""
+        if value is None:
+            return None
+        try:
+            price = float(value)
+            # Sanity check: within 50% of current price
+            if price <= 0:
+                return None
+            if abs(price - market_state.current_price) / market_state.current_price > 0.5:
+                logger.warning(f"LLM target {price} too far from current {market_state.current_price}")
+                return None
+            return price
+        except (ValueError, TypeError):
+            return None
 
     def _fallback_insights(self, market_state: MarketState) -> Dict[str, Any]:
         """Generate fallback insights without LLM."""
@@ -240,6 +259,29 @@ class DecisionEngine:
         This follows the architecture: SCAN -> SIGNAL -> RESEARCH -> DECIDE -> RISK VALIDATOR
         """
         try:
+            # CRITICAL: If Safe Mode is active and we have a losing position, CLOSE IT
+            if risk_state.safe_mode_active and position_state.current_side != Side.FLAT:
+                if position_state.entry_price and position_state.entry_price > 0:
+                    # Calculate unrealized PnL
+                    if position_state.current_side == Side.LONG:
+                        pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
+                    else:
+                        pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
+
+                    # If position is losing, force close it to free capital
+                    if pnl_pct < 0:
+                        logger.critical(
+                            f"SAFE MODE FORCE CLOSE: Position has {pnl_pct:.2f}% unrealized loss. "
+                            f"Generating CLOSE action to free capital and exit safe mode."
+                        )
+                        return self._create_close_action(position_state, market_state)
+
+                    # Even if profitable, close to reduce exposure in safe mode
+                    logger.warning(
+                        f"SAFE MODE: Closing position with {pnl_pct:.2f}% profit to reduce exposure."
+                    )
+                    return self._create_close_action(position_state, market_state)
+
             # Step 1: Generate signals
             logger.info("Generating trading signals...")
             signals = self.signal_manager.generate_signals(market_state)
@@ -274,8 +316,25 @@ class DecisionEngine:
 
             if not is_valid:
                 logger.warning(f"Trading action rejected by risk validator: {rejection_reason}")
+                
+                # --- NEW: Check for replacement opportunity on Max Positions Reached ---
+                if "Max positions reached" in rejection_reason and best_signal.confidence > 0.7:
+                    # Find the worst losing position among all active positions (assuming scanner/main loop provides this)
+                    # NOTE: This requires the calling function to provide the full list of positions and their PnL.
+                    # For now, we only have 'position_state' (for the current symbol) and 'active_positions' count.
+                    
+                    # Assume worst_position logic lives in the caller (Main Loop) and a flag is passed.
+                    # As a temporary fix, we will simply log this state, but real replacement needs context of ALL positions.
+                    
+                    # For proper replacement logic, we need to know the worst position's symbol/size/pnl.
+                    # We should fail the new trade, log the rejected trade, and rely on the aggressive close to clear the worst one.
+                    # For now, rely on aggressive close (should_close_position) or manual intervention.
+                    pass # Keep the hold action.
+                
                 self._record_decision(adjusted_signal, False, rejection_reason)
                 return self._create_hold_action()
+
+            # --- END NEW CHECK ---
 
             # Step 6: Calculate proper position size
             if adjusted_signal.action in [Action.BUY, Action.SELL]:
@@ -354,6 +413,32 @@ class DecisionEngine:
             expected_return=0.0,
             expected_risk=0.0,
             confidence=1.0
+        )
+
+    def _create_close_action(self, position_state: PositionState, market_state: MarketState) -> TradingAction:
+        """Create a close action for existing position."""
+        # Determine close direction (opposite of current position)
+        if position_state.current_side == Side.LONG:
+            close_action = Action.SELL
+        else:
+            close_action = Action.BUY
+
+        close_size = abs(position_state.position_size)
+
+        logger.info(
+            f"Creating CLOSE action: {close_action.value} size={close_size:.6f} "
+            f"to close {position_state.current_side.value} position"
+        )
+
+        return TradingAction(
+            action=close_action,
+            size=close_size,
+            expected_return=0.0,
+            expected_risk=0.0,
+            confidence=1.0,  # High confidence for forced close
+            stop_loss=None,
+            take_profit=None,
+            is_close=True,  # Explicitly mark as close action
         )
 
     def _record_decision(
@@ -440,46 +525,38 @@ class DecisionEngine:
                     logger.info("Trailing stop triggered for short position")
                     return True
 
-        # AGGRESSIVE CLOSE: MUCH FASTER reaction to losses
+        # AGGRESSIVE CLOSE: Time-based rules
         if position_state.entry_time:
             from datetime import datetime, timedelta
             age = datetime.now() - position_state.entry_time
-            age_minutes = age.total_seconds() / 60
             age_hours = age.total_seconds() / 3600
 
-            # Calculate current PnL if possible
-            pnl_pct = 0.0
-            if position_state.entry_price and position_state.position_size != 0:
-                if position_state.current_side == Side.LONG:
-                    pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
-                else:
-                    pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
-
-            # IMMEDIATE: Close if any position hits -2% loss regardless of age
-            if pnl_pct < -2.0:
-                logger.critical(f"EMERGENCY LOSS CUT: {pnl_pct:.2f}% loss - closing immediately!")
+            # Force close after 8 hours regardless of PnL
+            if age > timedelta(hours=8):
+                logger.info(f"Position age limit triggered: {age_hours:.1f} hours old (max 8h)")
                 return True
 
-            # Force close after 4 hours regardless of PnL (reduced from 8h)
+            # Aggressive rules apply only for positions older than 4 hours
             if age > timedelta(hours=4):
-                logger.info(f"Position age limit triggered: {age_hours:.1f} hours old (max 4h)")
-                return True
+                if position_state.entry_price and position_state.position_size != 0:
+                    pnl_pct = 0.0
+                    if position_state.current_side == Side.LONG:
+                        pnl_pct = ((market_state.current_price - position_state.entry_price) / position_state.entry_price) * 100
+                    else:
+                        pnl_pct = ((position_state.entry_price - market_state.current_price) / position_state.entry_price) * 100
 
-            # Quick aggressive rules after just 30 minutes (reduced from 4h!)
-            if age > timedelta(minutes=30):
-                # Close if loss > 0.8% (much more aggressive than 1.5%)
-                if pnl_pct < -0.8:
-                    logger.warning(f"Quick loss cut triggered ({age_minutes:.0f}min old): {pnl_pct:.2f}% loss")
-                    return True
+                    # Close if loss > 1.5%
+                    if pnl_pct < -1.5:
+                        logger.warning(f"Aggressive loss cut triggered for old position ({age_hours:.1f}h): {pnl_pct:.2f}% loss")
+                        return True
 
-                # Close if profit > 1.5% (take profits faster)
-                if pnl_pct > 1.5:
-                    logger.info(f"Quick profit take triggered ({age_minutes:.0f}min old): {pnl_pct:.2f}% profit")
-                    return True
+                    # Close if profit > 2.5%
+                    if pnl_pct > 2.5:
+                        logger.info(f"Aggressive profit take triggered for old position ({age_hours:.1f}h): {pnl_pct:.2f}% profit")
+                        return True
 
-        # CRITICAL: Safe mode forces closure of ALL positions
+        # Check risk limits — safe mode forces closure of low-confidence positions
         if risk_state.safe_mode_active:
-            logger.critical("SAFE MODE ACTIVE - Force closing position for risk protection")
-            return True
+            logger.info("Safe mode active - considering position closure")
 
         return False

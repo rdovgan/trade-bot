@@ -92,8 +92,12 @@ class MockJournal:
     def __init__(self):
         self.recorded_trades = []
 
-    def record_trade(self, **kwargs):
-        self.recorded_trades.append(kwargs)
+    def record_trade(self, trade, market_state):
+        """Record trade with new API signature (Trade, MarketState objects)."""
+        self.recorded_trades.append({
+            'trade': trade,
+            'market_state': market_state,
+        })
 
 
 @pytest.fixture
@@ -181,8 +185,9 @@ class TestStopLossMonitoring:
         # Trade should be completed and persisted to journal
         assert len(mock_journal.recorded_trades) > 0
         recorded = mock_journal.recorded_trades[0]
-        assert recorded['exit_price'] == stop_order.stop_price
-        assert recorded['pnl'] < 0  # Should be a loss
+        trade = recorded['trade']
+        assert trade.exit_price == stop_order.stop_price
+        assert trade.pnl < 0  # Should be a loss
 
     @pytest.mark.asyncio
     async def test_order_monitoring_task_starts_and_stops(self, execution_engine):

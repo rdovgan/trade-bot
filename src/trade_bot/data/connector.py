@@ -340,8 +340,47 @@ class MarketDataProcessor:
         else:
             return Regime.MEAN_REVERT
 
+    def _validate_ohlcv(self, ohlcv: pd.DataFrame, symbol: str, timeframe: str) -> None:
+        """Validate OHLCV data quality and freshness. Raises ValueError if invalid."""
+        if ohlcv.empty:
+            raise ValueError(f"Empty OHLCV data for {symbol}")
+
+        # Check for NaN values
+        if ohlcv.isnull().any().any():
+            nan_cols = ohlcv.columns[ohlcv.isnull().any()].tolist()
+            raise ValueError(f"OHLCV for {symbol} contains NaN in columns: {nan_cols}")
+
+        # Check for infinite values
+        if np.isinf(ohlcv.values).any():
+            raise ValueError(f"OHLCV for {symbol} contains infinite values")
+
+        # Check for zero/negative prices
+        price_cols = ['open', 'high', 'low', 'close']
+        for col in price_cols:
+            if col in ohlcv.columns and (ohlcv[col] <= 0).any():
+                raise ValueError(f"OHLCV for {symbol} contains zero/negative prices in {col}")
+
+        # Check freshness
+        latest_timestamp = ohlcv.index[-1]
+        now = datetime.now()
+
+        # Map timeframe to max acceptable age
+        base_max_age = {
+            '1m': timedelta(minutes=5),
+            '5m': timedelta(minutes=15),
+            '15m': timedelta(minutes=45),
+            '1h': timedelta(hours=3),
+        }.get(timeframe, timedelta(minutes=10))
+
+        # Apply multiplier (higher for sandbox/testnet)
+        max_age = timedelta(seconds=base_max_age.total_seconds() * self.max_data_age_multiplier)
+
+        age = now - latest_timestamp
+        if age > max_age:
+            raise ValueError(f"OHLCV for {symbol} is stale: last candle {latest_timestamp}, age {age}, max {max_age}")
+
     def _validate_ohlcv_freshness(self, ohlcv: pd.DataFrame, timeframe: str) -> bool:
-        """Validate that market data is fresh."""
+        """Validate that market data is fresh. Returns bool for backward compatibility."""
         if ohlcv.empty:
             return False
 
@@ -368,7 +407,7 @@ class MarketDataProcessor:
         return True
 
     def _validate_ohlcv_data(self, ohlcv: pd.DataFrame) -> bool:
-        """Validate OHLCV data quality."""
+        """Validate OHLCV data quality. Returns bool for backward compatibility."""
         if ohlcv.empty:
             return False
 
@@ -404,13 +443,8 @@ class MarketDataProcessor:
             # Get market data
             ohlcv = await connector.get_ohlcv(symbol, timeframe, limit=200)
 
-            # Validate data quality
-            if not self._validate_ohlcv_data(ohlcv):
-                raise ValueError(f"Invalid OHLCV data for {symbol}")
-
-            # Validate freshness
-            if not self._validate_ohlcv_freshness(ohlcv, timeframe):
-                raise ValueError(f"Stale market data for {symbol}")
+            # Validate data quality and freshness (raises ValueError with details)
+            self._validate_ohlcv(ohlcv, symbol, timeframe)
 
             ticker = await connector.get_ticker(symbol)
             order_book = await connector.get_order_book(symbol)

@@ -255,11 +255,12 @@ class VolatilityBreakoutSignal(SignalGenerator):
 
 class SignalManager:
     """Manages multiple signal generators."""
-    
+
     def __init__(self):
         """Initialize signal manager."""
         self.generators: List[SignalGenerator] = []
         self.regime_generators: Dict[Regime, List[SignalGenerator]] = {}
+        self._last_price: Optional[float] = None  # Cache for LLM adjustments
         logger.info("Signal manager initialized")
     
     def add_generator(self, generator: SignalGenerator):
@@ -276,6 +277,9 @@ class SignalManager:
         market_state: MarketState
     ) -> List[TradingAction]:
         """Generate signals from all generators. Regime match boosts confidence."""
+        # Cache last price for LLM adjustments
+        self._last_price = market_state.current_price
+
         signals = []
         current_regime = market_state.regime_label
 
@@ -303,11 +307,15 @@ class SignalManager:
         """Select the best signal from multiple signals."""
         if not signals:
             return None
-        
+
         # Sort by confidence and return the highest confidence signal
         best_signal = max(signals, key=lambda s: s.confidence)
         logger.info(f"Selected best signal: {best_signal.action.value} with confidence {best_signal.confidence:.2f}")
         return best_signal
+
+    def get_last_price(self) -> Optional[float]:
+        """Get the last cached market price."""
+        return self._last_price
 
 
 def create_default_signal_manager() -> SignalManager:

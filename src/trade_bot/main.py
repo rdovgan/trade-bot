@@ -357,8 +357,8 @@ class TradingBot:
                 logger.warning(f"Skipping {symbol}: {e}")
                 return  # Skip this symbol if data is invalid
             
-            # Get position state
-            position_state = self.position_monitor.get_position(symbol) or PositionState()
+            # Get position state (thread-safe)
+            position_state = await self.position_monitor.get_position_safe(symbol) or PositionState()
             
             # Update account state (simplified)
             await self._update_account_state()
@@ -433,8 +433,8 @@ class TradingBot:
                                     worst_pnl_pct = pnl_pct
                                     worst_symbol = pos_symbol
 
-                        # Close worst position if losing > 0.5% (more aggressive)
-                        if worst_symbol and worst_pnl_pct < -0.5:
+                        # Close worst position if losing > 1%
+                        if worst_symbol and worst_pnl_pct < -1.0:
                             logger.warning(
                                 f"Max positions ({max_positions}) reached. Closing worst position "
                                 f"{worst_symbol} (PnL: {worst_pnl_pct:.2f}%) to make room for {symbol}"
@@ -483,7 +483,7 @@ class TradingBot:
     async def _close_position(self, symbol: str, market_state: MarketState):
         """Close existing position."""
         try:
-            position = self.position_monitor.get_position(symbol)
+            position = await self.position_monitor.get_position_safe(symbol)
             if not position or position.current_side == Side.FLAT:
                 return
 
@@ -493,7 +493,8 @@ class TradingBot:
                 size=abs(position.position_size),
                 expected_return=0,
                 expected_risk=0,
-                confidence=1.0
+                confidence=1.0,
+                is_close=True,  # Explicitly mark as close action
             )
             
             # Execute close
@@ -509,7 +510,28 @@ class TradingBot:
             
         except Exception as e:
             logger.error(f"Error closing position for {symbol}: {e}")
-    
+
+    def _calculate_drawdown(self, equity: float) -> float:
+        """Calculate current drawdown safely, handling edge cases."""
+        # Handle invalid peak equity
+        if self._peak_equity is None or self._peak_equity <= 0:
+            logger.warning(f"Invalid peak equity: {self._peak_equity}, resetting to current")
+            self._peak_equity = equity
+            return 0.0
+
+        # Handle invalid current equity (trigger emergency)
+        if equity <= 0:
+            logger.error(f"Invalid current equity: {equity}")
+            return 1.0  # 100% drawdown - should trigger emergency
+
+        # Update peak if new high
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+            return 0.0
+
+        # Calculate drawdown
+        return (self._peak_equity - equity) / self._peak_equity
+
     async def _update_account_state(self):
         """Update account state from exchange."""
         async with state_manager.lock_state("account"):
@@ -564,23 +586,20 @@ class TradingBot:
                     self._day_start_equity = equity
                     logger.info(f"New trading day — start equity: {self._day_start_equity:.2f}")
 
-                # Update peak equity (high-water mark)
-                if equity > self._peak_equity:
-                    self._peak_equity = equity
-
-                # Calculate current drawdown from peak
-                self.account_state.current_drawdown = (
-                    (self._peak_equity - equity) / self._peak_equity
-                )
+                # Calculate current drawdown safely (also updates peak)
+                self.account_state.current_drawdown = self._calculate_drawdown(equity)
 
                 # Track max drawdown
                 if self.account_state.current_drawdown > self.account_state.max_drawdown:
                     self.account_state.max_drawdown = self.account_state.current_drawdown
 
-                # Calculate daily loss (including unrealized PnL)
+                # Calculate daily loss safely (including unrealized PnL)
                 daily_change = equity - self._day_start_equity
                 self.account_state.daily_pnl = daily_change
-                self.account_state.daily_loss_pct = max(0.0, -daily_change / self._day_start_equity)
+                if self._day_start_equity and self._day_start_equity > 0:
+                    self.account_state.daily_loss_pct = max(0.0, -daily_change / self._day_start_equity)
+                else:
+                    self.account_state.daily_loss_pct = 0.0
 
                 # Emergency: if drawdown exceeds lock threshold, close all and lock
                 lock_threshold = self.risk_validator.config.get("drawdown_lock_threshold", 0.10)
@@ -595,49 +614,83 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Error updating account state: {e}")
 
-    async def _emergency_close_all(self):
-        """Emergency close all open positions with proper order cleanup."""
+    async def _emergency_close_all(self) -> Dict[str, str]:
+        """Emergency close all open positions with validation.
+
+        Returns:
+            Dict mapping symbol to status ('closed', 'failed', 'already_flat', 'error: ...')
+        """
+        results = {}
+
         try:
             # 1. Cancel ALL pending orders first
-            logger.critical("Cancelling all pending orders...")
+            logger.critical("EMERGENCY: Cancelling all pending orders...")
             await self.execution_engine.cancel_all_orders()
 
-            # 2. Close all positions
-            all_positions = self.position_monitor.get_all_positions()
+            # 2. Get all positions
+            all_positions = await self.position_monitor.get_all_positions_safe()
+
+            # 3. Close each position
             for symbol, position in all_positions.items():
-                if position.current_side != Side.FLAT:
-                    logger.critical(f"Emergency closing position: {symbol}")
-                    # Build a dummy market state just for the close
+                if position.current_side == Side.FLAT:
+                    results[symbol] = "already_flat"
+                    continue
+
+                try:
+                    logger.critical(f"Emergency closing: {symbol}")
                     close_action = TradingAction(
                         action=Action.SELL if position.current_side == Side.LONG else Action.BUY,
                         size=abs(position.position_size),
                         expected_return=0,
                         expected_risk=0,
                         confidence=1.0,
+                        is_close=True,  # Explicitly mark as close action
                     )
-                    try:
-                        await self.execution_engine.execute_action(
-                            close_action, symbol, position.entry_price or 0
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to emergency close {symbol}: {e}")
+                    await self.execution_engine.execute_action(
+                        close_action, symbol, position.entry_price or 0
+                    )
 
-            # 3. Set lock flag and persist
+                    # Verify closed - wait briefly for exchange to update
+                    await asyncio.sleep(2)
+                    updated_pos = await self.position_monitor.get_position_safe(symbol)
+                    if updated_pos and updated_pos.current_side != Side.FLAT:
+                        results[symbol] = "failed"
+                        logger.error(f"Failed to close {symbol} - still has position")
+                    else:
+                        results[symbol] = "closed"
+                except Exception as e:
+                    results[symbol] = f"error: {e}"
+                    logger.error(f"Error closing {symbol}: {e}")
+
+            # 4. Verify all closed and report
+            failed = [s for s, status in results.items() if status not in ("closed", "already_flat")]
+            if failed:
+                logger.critical(f"EMERGENCY CLOSE INCOMPLETE! Failed symbols: {failed}")
+
+            # 5. Lock system and persist state with results
             self._system_locked = True
-            self._persist_lock_state(True)
+            self._persist_lock_state(True, results)
+
+            return results
 
         except Exception as e:
-            logger.error(f"Error in emergency close all: {e}")
+            logger.critical(f"Emergency close failed: {e}")
+            self._system_locked = True
+            self._persist_lock_state(True, {"error": str(e)})
+            raise
 
-    def _persist_lock_state(self, locked: bool):
-        """Persist system lock to file."""
+    def _persist_lock_state(self, locked: bool, results: Optional[Dict[str, str]] = None):
+        """Persist system lock to file with close results."""
         import json
         lock_file = Path("trade_bot_lock.json")
-        lock_file.write_text(json.dumps({
+        lock_data = {
             "locked": locked,
             "timestamp": datetime.now().isoformat(),
-            "reason": "emergency_drawdown"
-        }))
+            "reason": "emergency_drawdown",
+        }
+        if results:
+            lock_data["close_results"] = results
+        lock_file.write_text(json.dumps(lock_data, indent=2))
         logger.info(f"Persisted lock state: locked={locked}")
 
     def _load_lock_state(self) -> bool:
@@ -655,23 +708,32 @@ class TradingBot:
         """Background task to track funding rate costs every 8 hours."""
         while self._running:
             try:
-                all_positions = self.position_monitor.get_all_positions()
+                all_positions = await self.position_monitor.get_all_positions_safe()
 
                 for symbol, position in all_positions.items():
                     if position.current_side != Side.FLAT:
+                        # Get CURRENT market price for accurate notional calculation
+                        current_price = await self._get_current_price(symbol)
+                        if not current_price:
+                            logger.warning(f"Could not get current price for {symbol}, using entry price")
+                            current_price = position.entry_price or 0
+
                         # Get funding rate
                         funding_rate = await self.data_connector.get_funding_rate(symbol)
 
-                        # Calculate funding cost
-                        notional = abs(position.position_size * position.entry_price) if position.entry_price else 0
+                        # Calculate funding cost using CURRENT price (not entry price)
+                        notional = abs(position.position_size * current_price)
                         funding_cost = notional * funding_rate
 
                         # Find open trade and add to funding_cost
-                        open_trade = next((t for t in self.execution_engine._trades
-                                         if t.symbol == symbol and t.status == "open"), None)
+                        open_trade = await self.execution_engine.get_open_trade(symbol)
                         if open_trade:
-                            open_trade.funding_cost += funding_cost
-                            logger.info(f"Accumulated funding cost for {symbol}: ${funding_cost:.4f} (rate: {funding_rate:.6f})")
+                            async with state_manager.lock_state("trades"):
+                                open_trade.funding_cost += funding_cost
+                            logger.info(
+                                f"Funding {symbol}: notional={notional:.2f} (price={current_price:.2f}), "
+                                f"rate={funding_rate:.6f}, cost=${funding_cost:.4f}"
+                            )
 
                 # Wait 8 hours (28800 seconds)
                 await asyncio.sleep(28800)

@@ -107,7 +107,7 @@ class RiskState(BaseModel):
 
 class TradingAction(BaseModel):
     """Trading action schema."""
-    
+
     action: Action = Field(description="Trading action")
     size: float = Field(description="Position size")
     stop_loss: Optional[float] = Field(default=None, description="Stop loss price")
@@ -115,6 +115,7 @@ class TradingAction(BaseModel):
     expected_return: float = Field(description="Expected return")
     expected_risk: float = Field(description="Expected risk")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence level (0-1)")
+    is_close: bool = Field(default=False, description="True if this action closes existing position")
     
     @validator('expected_return', 'expected_risk')
     def validate_positive(cls, v):
